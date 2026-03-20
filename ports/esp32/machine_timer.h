@@ -57,6 +57,14 @@ machine_timer_obj_t *machine_timer_create(mp_uint_t timer);
 void machine_timer_enable(machine_timer_obj_t *self);
 void machine_timer_disable(machine_timer_obj_t *self);
 
+// Lightweight restart/stop for rapid cycling (e.g. RXIDLE).
+// Unlike enable/disable, these don't reinitialize the timer peripheral —
+// they just toggle the counter, avoiding costly register resets that can
+// corrupt other peripherals sharing the same timer group (e.g. esp_timer).
+// The timer must have been machine_timer_enable()'d at least once before use.
+void machine_timer_restart(machine_timer_obj_t *self);
+void machine_timer_stop(machine_timer_obj_t *self);
+
 uint32_t machine_timer_freq_hz(void);
 
 #endif // MICROPY_INCLUDED_ESP32_MACHINE_TIMER_H

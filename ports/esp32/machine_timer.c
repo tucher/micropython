@@ -171,6 +171,32 @@ static void machine_timer_isr_handler(machine_timer_obj_t *self) {
     mp_hal_wake_main_task_from_isr();
 }
 
+void machine_timer_restart(machine_timer_obj_t *self) {
+    // Lightweight restart: reset counter and re-enable, without touching
+    // the peripheral bus clock or reinitializing registers.
+    // Requires machine_timer_enable() to have been called at least once.
+    timer_ll_enable_counter(self->hal_context.dev, self->index, false);
+    timer_hal_set_counter_value(&self->hal_context, 0);
+    timer_ll_clear_intr_status(self->hal_context.dev, TIMER_LL_EVENT_ALARM(self->index));
+    timer_ll_enable_alarm(self->hal_context.dev, self->index, true);
+    if (self->handle) {
+        ESP_ERROR_CHECK(esp_intr_enable(self->handle));
+    }
+    timer_ll_enable_counter(self->hal_context.dev, self->index, true);
+}
+
+void machine_timer_stop(machine_timer_obj_t *self) {
+    // Lightweight stop: just disable the counter, alarm and interrupt.
+    // Does not deinitialize the timer or release peripheral clocks.
+    if (self->hal_context.dev != NULL) {
+        timer_ll_enable_counter(self->hal_context.dev, self->index, false);
+        timer_ll_enable_alarm(self->hal_context.dev, self->index, false);
+    }
+    if (self->handle) {
+        ESP_ERROR_CHECK(esp_intr_disable(self->handle));
+    }
+}
+
 void machine_timer_enable(machine_timer_obj_t *self) {
     // Initialise the timer.
     timer_hal_init(&self->hal_context, self->group, self->index);

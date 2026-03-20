@@ -133,7 +133,7 @@ static void uart_timer_callback(machine_timer_obj_t *timer) {
         self->mp_irq_flags = UART_IRQ_RXIDLE;
         mp_irq_handler(self->mp_irq_obj);
         mp_hal_wake_main_task_from_isr();
-        machine_timer_disable(self->rxidle_timer);
+        machine_timer_stop(self->rxidle_timer);
     }
 }
 
@@ -150,7 +150,7 @@ static void uart_event_task(void *self_in) {
                     if (self->mp_irq_trigger & UART_IRQ_RXIDLE) {
                         if (self->rxidle_state != RXIDLE_INACTIVE) {
                             if (self->rxidle_state == RXIDLE_STANDBY) {
-                                machine_timer_enable(self->rxidle_timer);
+                                machine_timer_restart(self->rxidle_timer);
                             }
                         }
                         self->rxidle_state = RXIDLE_ALERT;
@@ -602,6 +602,12 @@ static void uart_irq_configure_timer(machine_uart_obj_t *self, mp_uint_t trigger
         // data field to hold a reference to the UART object.
         self->rxidle_timer->callback = self;
         self->rxidle_timer->repeat = true;
+        // Do the full (heavy) initialization once here. Subsequent RXIDLE
+        // cycles use machine_timer_restart()/machine_timer_stop() which are
+        // lightweight and don't touch the peripheral bus clock or reset
+        // timer group registers — avoiding corruption of esp_timer (TG0_LAC).
+        machine_timer_enable(self->rxidle_timer);
+        machine_timer_stop(self->rxidle_timer);
         self->rxidle_state = RXIDLE_STANDBY;
     }
 }
