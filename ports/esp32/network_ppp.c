@@ -92,6 +92,11 @@ typedef struct _network_ppp_obj_t {
     // True when the stream accepted MP_STREAM_SET_DATA_SINK, i.e. incoming data
     // is delivered straight to C instead of through the MicroPython scheduler.
     bool c_sink_installed;
+    // VM-free, non-blocking writer obtained from the stream, used by the PPP
+    // output callback so that lwIP's tcpip thread never enters the VM and never
+    // waits on the UART. Zeroed when unavailable; then the mp_stream_rw()
+    // fallback below is used.
+    mp_stream_c_writer_t c_writer;
     // True when the fallback path installed a Python-level stream IRQ. Tracked
     // so that detaching is idempotent: network_ppp_stream_uart_irq_disable() is
     // also reached from the PPP status callback, which runs on the lwIP thread,
@@ -158,6 +163,9 @@ static void network_ppp_stream_uart_irq_disable(network_ppp_obj_t *self) {
     if (self->stream == mp_const_none) {
         return;
     }
+
+    self->c_writer.write = NULL;
+    self->c_writer.ctx = NULL;
 
     if (self->c_sink_installed) {
         network_ppp_set_data_sink(self, false);
@@ -231,6 +239,8 @@ static mp_obj_t network_ppp_make_new(const mp_obj_type_t *type, size_t n_args, s
     self->listed = false;
     self->c_sink_installed = false;
     self->py_irq_installed = false;
+    self->c_writer.write = NULL;
+    self->c_writer.ctx = NULL;
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -294,6 +304,16 @@ static void network_ppp_stream_uart_irq_enable(network_ppp_obj_t *self) {
     // MicroPython scheduler getting a turn (see docs/ppp_plan_max.md, D1).
     if (network_ppp_set_data_sink(self, true)) {
         self->c_sink_installed = true;
+        // Ask for the matching outbound path. Optional: a stream may support
+        // the sink but not the writer (e.g. a UART with no TX ring buffer).
+        const mp_stream_p_t *stream_p = mp_get_stream(self->stream);
+        mp_stream_c_writer_t writer = { NULL, NULL };
+        int errcode = 0;
+        if (stream_p != NULL && stream_p->ioctl != NULL
+            && stream_p->ioctl(self->stream, MP_STREAM_GET_C_WRITER,
+                (uintptr_t)&writer, &errcode) != MP_STREAM_ERROR) {
+            self->c_writer = writer;
+        }
         return;
     }
 
@@ -391,6 +411,15 @@ static u32_t network_ppp_output_callback(ppp_pcb *pcb, u8_t *data, u32_t len, vo
     }
     mp_printf(&mp_plat_print, ")\n");
     #endif
+    // Preferred: write without entering the VM and without blocking. This
+    // callback runs on the lwIP tcpip thread; blocking here stalls the whole
+    // stack, and calling the stream protocol from this context is the defect
+    // behind micropython#16701. A short return is read by lwIP as an error and
+    // the frame is dropped, which is the correct meaning of a congested link.
+    if (self->c_writer.write != NULL) {
+        return self->c_writer.write(self->c_writer.ctx, (const uint8_t *)data, len);
+    }
+
     mp_obj_t stream = self->stream;
     if (stream == mp_const_none) {
         return 0;

@@ -127,6 +127,7 @@ typedef struct _machine_uart_obj_t {
     void *c_sink_ctx;
     volatile bool c_sink_running;   // set while inside the callback
     volatile uint32_t rx_overrun;   // FIFO overflows + ring-buffer-full events
+    volatile uint32_t tx_congested; // writes refused because the TX ring was full
 } machine_uart_obj_t;
 
 static const char *_parity_name[] = {"None", "1", "0"};
@@ -242,7 +243,11 @@ static void mp_machine_uart_print(const mp_print_t *print, mp_obj_t self_in, mp_
     mp_printf(print, "UART(%u, baudrate=%u, bits=%u, parity=%s, stop=%u, tx=%d, rx=%d, rts=%d, cts=%d, txbuf=%u, rxbuf=%u, timeout=%u, timeout_char=%u, irq=%d",
         self->uart_num, baudrate, self->bits, _parity_name[self->parity],
         self->stop, self->tx, self->rx, self->rts, self->cts, self->txbuf, self->rxbuf, self->timeout, self->timeout_char, self->mp_irq_trigger);
-    mp_printf(print, ", rxovf=%u", self->rx_overrun);
+    mp_printf(print, ", rxovf=%u, txcong=%u", self->rx_overrun, self->tx_congested);
+    if (self->uart_event_task != NULL) {
+        mp_printf(print, ", taskstack=%u",
+            (unsigned)uxTaskGetStackHighWaterMark(self->uart_event_task));
+    }
     if (self->invert) {
         mp_printf(print, ", invert=");
         uint32_t invert_mask = self->invert;
@@ -523,6 +528,7 @@ static mp_obj_t mp_machine_uart_make_new(const mp_obj_type_t *type, size_t n_arg
         self->c_sink_ctx = NULL;
         self->c_sink_running = false;
         self->rx_overrun = 0;
+        self->tx_congested = 0;
         // remaining fields are set from inside mp_machine_uart_init_helper()
     }
 
@@ -651,6 +657,13 @@ static mp_irq_obj_t *mp_machine_uart_irq(machine_uart_obj_t *self, bool any_args
         mp_raise_ValueError(MP_ERROR_TEXT("REPL UART does not support IRQs"));
     }
 
+    if (any_args && self->c_sink != NULL) {
+        // Same ownership rule as read(): the C consumer is driving this UART.
+        // Note write() is deliberately still allowed -- the fallback receive
+        // path needs it, and transmitting does not race with the sink.
+        mp_raise_OSError(MP_EBUSY);
+    }
+
     if (self->mp_irq_obj == NULL) {
         self->mp_irq_trigger = 0;
         self->mp_irq_obj = mp_irq_new(&uart_irq_methods, MP_OBJ_FROM_PTR(self));
@@ -703,6 +716,14 @@ static mp_irq_obj_t *mp_machine_uart_irq(machine_uart_obj_t *self, bool any_args
 static mp_uint_t mp_machine_uart_read(mp_obj_t self_in, void *buf_in, mp_uint_t size, int *errcode) {
     machine_uart_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
+    if (self->c_sink != NULL) {
+        // A C consumer (e.g. PPP) owns the receive path. Reading here would
+        // steal its bytes and silently break the link, which used to happen
+        // with no diagnostic at all.
+        *errcode = MP_EBUSY;
+        return MP_STREAM_ERROR;
+    }
+
     // make sure we want at least 1 char
     if (size == 0) {
         return 0;
@@ -745,6 +766,25 @@ static mp_uint_t mp_machine_uart_write(mp_obj_t self_in, const void *buf_in, mp_
 
     // return number of bytes written
     return bytes_written;
+}
+
+// Non-blocking write for MP_STREAM_GET_C_WRITER. Checks the TX ring has room
+// before handing data to uart_write_bytes(), which would otherwise block until
+// it fits -- and the caller here is typically lwIP's tcpip thread, which must
+// never wait on a UART. A refused write is reported as 0 bytes, i.e. link
+// congestion, which the caller is expected to handle (TCP retransmits).
+static size_t machine_uart_c_write(void *ctx, const uint8_t *buf, size_t len) {
+    machine_uart_obj_t *self = ctx;
+    size_t free_size = 0;
+    if (uart_get_tx_buffer_free_size(self->uart_num, &free_size) != ESP_OK) {
+        return 0;
+    }
+    if (free_size < len) {
+        self->tx_congested++;
+        return 0;
+    }
+    int written = uart_write_bytes(self->uart_num, buf, len);
+    return written < 0 ? 0 : (size_t)written;
 }
 
 static mp_uint_t mp_machine_uart_ioctl(mp_obj_t self_in, mp_uint_t request, uintptr_t arg, int *errcode) {
@@ -790,6 +830,17 @@ static mp_uint_t mp_machine_uart_ioctl(mp_obj_t self_in, mp_uint_t request, uint
             self->c_sink_ctx = cfg->ctx;
             self->c_sink = cfg->handler;
         }
+        ret = 0;
+    } else if (request == MP_STREAM_GET_C_WRITER) {
+        // Needs a TX ring buffer: without one uart_write_bytes() pushes straight
+        // into the FIFO and blocks, which is exactly what this exists to avoid.
+        if (self->txbuf == 0) {
+            *errcode = MP_EINVAL;
+            return MP_STREAM_ERROR;
+        }
+        mp_stream_c_writer_t *w = (mp_stream_c_writer_t *)arg;
+        w->write = machine_uart_c_write;
+        w->ctx = self;
         ret = 0;
     } else {
         *errcode = MP_EINVAL;

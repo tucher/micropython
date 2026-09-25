@@ -62,6 +62,21 @@ typedef struct _mp_stream_data_sink_t_cfg {
     mp_stream_data_sink_t handler;
     void *ctx;
 } mp_stream_data_sink_cfg_t;
+
+#define MP_STREAM_GET_C_WRITER      (14) // Obtain a VM-free, non-blocking writer
+
+// Counterpart of MP_STREAM_SET_DATA_SINK for the outgoing direction. A stream
+// that implements this hands back a function that writes without entering the
+// VM and without blocking, so a C producer running on a foreign thread (the
+// lwIP tcpip thread, say) can transmit without stalling that thread or touching
+// MicroPython state. Returns the number of bytes accepted, which may be 0 when
+// the stream is congested; the caller decides what that means.
+typedef size_t (*mp_stream_c_write_t)(void *ctx, const uint8_t *buf, size_t len);
+
+typedef struct _mp_stream_c_writer_t {
+    mp_stream_c_write_t write;
+    void *ctx;
+} mp_stream_c_writer_t;
 #endif
 
 // These poll ioctl values are compatible with Linux
