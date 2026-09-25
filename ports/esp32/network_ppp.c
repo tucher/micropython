@@ -37,7 +37,11 @@
 
 #if defined(CONFIG_ESP_NETIF_TCPIP_LWIP) && defined(CONFIG_LWIP_PPP_SUPPORT)
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "lwip/dns.h"
+#include "lwip/netifapi.h"
 #include "netif/ppp/ppp.h"
 #include "netif/ppp/pppapi.h"
 #include "netif/ppp/pppos.h"
@@ -45,6 +49,9 @@
 // Includes for port-specific changes compared to network_ppp_lwip.c
 #include "shared/netutils/netutils.h"
 #include "ppp_set_auth.h"
+
+// Enable to trace what network_ppp_deinit_all() does at soft reset.
+#define NETWORK_PPP_DEINIT_TRACE (0)
 
 // Enable this to see the serial data going between the PPP layer.
 #define PPP_TRACE_IN_OUT (0)
@@ -64,14 +71,104 @@ typedef struct _network_ppp_obj_t {
     mp_obj_t stream;
     ppp_pcb *pcb;
     struct netif netif;
+    // Live sessions are kept on a list so that shutdown can find them; see
+    // network_ppp_deinit_all(). lwIP's global netif_list holds a pointer to the
+    // `netif` member above and its callbacks hold `self`, neither of which the
+    // GC can see, so the object's lifetime has to be managed explicitly rather
+    // than left to reachability.
+    //
+    // In ordinary operation the object happens to be reachable anyway, via
+    // machine_uart_objs -> uart -> mp_irq_obj -> handler (a bound method of
+    // this object). That protection disappears when the stream IRQ is detached
+    // -- config(stream=None) -- and it is irrelevant at soft reset, where
+    // gc_sweep_all() frees everything regardless of reachability. Making the
+    // list a GC root closes both cases.
+    //
+    // Entries are reaped lazily (see network_ppp_reap) because the status
+    // callback that clears `pcb` runs on the lwIP thread and must not mutate
+    // the list.
+    struct _network_ppp_obj_t *next;
+    bool listed;
+    // True when the stream accepted MP_STREAM_SET_DATA_SINK, i.e. incoming data
+    // is delivered straight to C instead of through the MicroPython scheduler.
+    bool c_sink_installed;
+    // True when the fallback path installed a Python-level stream IRQ. Tracked
+    // so that detaching is idempotent: network_ppp_stream_uart_irq_disable() is
+    // also reached from the PPP status callback, which runs on the lwIP thread,
+    // and calling the stream's .irq() method from there enters the VM and can
+    // allocate GC memory. See the note above network_ppp_status_cb().
+    bool py_irq_installed;
 } network_ppp_obj_t;
 
+static void network_ppp_list_add(network_ppp_obj_t *self) {
+    if (self->listed) {
+        return;
+    }
+    self->next = MP_STATE_PORT(network_ppp_obj_head);
+    MP_STATE_PORT(network_ppp_obj_head) = self;
+    self->listed = true;
+}
+
+// Drop finished sessions from the root list so they can be collected again.
+// Only ever called from the MicroPython thread.
+static void network_ppp_reap(void) {
+    network_ppp_obj_t **link = &MP_STATE_PORT(network_ppp_obj_head);
+    while (*link != NULL) {
+        network_ppp_obj_t *self = *link;
+        if (self->pcb == NULL) {
+            *link = self->next;
+            self->next = NULL;
+            self->listed = false;
+        } else {
+            link = &self->next;
+        }
+    }
+}
+
 const mp_obj_type_t esp_network_ppp_lwip_type;
+
+// Receive path when the stream supports a C sink. Runs on the stream's own
+// task (for machine.UART: uart_event_task), never on the MicroPython thread, so
+// PPP keeps receiving even while the VM is blocked in a C call. Must not touch
+// the VM. pppos_input_tcpip() is the thread-safe lwIP entry point.
+static void network_ppp_data_sink(void *ctx, const uint8_t *buf, size_t len) {
+    network_ppp_obj_t *self = ctx;
+    ppp_pcb *pcb = self->pcb;
+    if (pcb != NULL && self->state >= STATE_ACTIVE) {
+        pppos_input_tcpip(pcb, (u8_t *)buf, len);
+    }
+}
+
+// Returns true if the stream took the sink configuration.
+static bool network_ppp_set_data_sink(network_ppp_obj_t *self, bool enable) {
+    const mp_stream_p_t *stream_p = mp_get_stream(self->stream);
+    if (stream_p == NULL || stream_p->ioctl == NULL) {
+        return false;
+    }
+    mp_stream_data_sink_cfg_t cfg = {
+        .handler = enable ? network_ppp_data_sink : NULL,
+        .ctx = enable ? self : NULL,
+    };
+    int errcode = 0;
+    mp_uint_t res = stream_p->ioctl(self->stream, MP_STREAM_SET_DATA_SINK, (uintptr_t)&cfg, &errcode);
+    return res != MP_STREAM_ERROR;
+}
 
 static void network_ppp_stream_uart_irq_disable(network_ppp_obj_t *self) {
     if (self->stream == mp_const_none) {
         return;
     }
+
+    if (self->c_sink_installed) {
+        network_ppp_set_data_sink(self, false);
+        self->c_sink_installed = false;
+        return;
+    }
+
+    if (!self->py_irq_installed) {
+        return;
+    }
+    self->py_irq_installed = false;
 
     // Disable UART IRQ.
     mp_obj_t dest[3];
@@ -80,6 +177,12 @@ static void network_ppp_stream_uart_irq_disable(network_ppp_obj_t *self) {
     mp_call_method_n_kw(1, 0, dest);
 }
 
+// NOTE: this runs on the lwIP tcpip thread, not the MicroPython thread. Anything
+// it calls must stay out of the VM: network_ppp_stream_uart_irq_disable() below
+// is safe only because the C-sink path is pure C and the Python fallback path is
+// guarded by py_irq_installed (it has already run on the MicroPython thread by
+// the time we get here). Reaching the stream's .irq() method from this context
+// allocates GC memory from the wrong thread and crashes in gc_alloc().
 static void network_ppp_status_cb(ppp_pcb *pcb, int err_code, void *ctx) {
     network_ppp_obj_t *self = ctx;
     switch (err_code) {
@@ -118,10 +221,16 @@ static mp_obj_t network_ppp_make_new(const mp_obj_type_t *type, size_t n_args, s
         mp_get_stream_raise(stream, MP_STREAM_OP_READ | MP_STREAM_OP_WRITE);
     }
 
+    network_ppp_reap();
+
     network_ppp_obj_t *self = mp_obj_malloc_with_finaliser(network_ppp_obj_t, type);
     self->state = STATE_INACTIVE;
     self->stream = stream;
     self->pcb = NULL;
+    self->next = NULL;
+    self->listed = false;
+    self->c_sink_installed = false;
+    self->py_irq_installed = false;
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -181,12 +290,20 @@ static void network_ppp_stream_uart_irq_enable(network_ppp_obj_t *self) {
         return;
     }
 
-    // Enable UART IRQ to call PPP.poll() when incoming data is ready.
+    // Preferred: a C-level sink, so the data path does not depend on the
+    // MicroPython scheduler getting a turn (see docs/ppp_plan_max.md, D1).
+    if (network_ppp_set_data_sink(self, true)) {
+        self->c_sink_installed = true;
+        return;
+    }
+
+    // Fallback for streams without that support: soft IRQ calling PPP.poll().
     mp_obj_t dest[4];
     mp_load_method(self->stream, MP_QSTR_irq, dest);
     dest[2] = mp_obj_new_bound_meth(MP_OBJ_FROM_PTR(&network_ppp_poll_obj), MP_OBJ_FROM_PTR(self));
     dest[3] = mp_load_attr(self->stream, MP_QSTR_IRQ_RXIDLE);
     mp_call_method_n_kw(2, 0, dest);
+    self->py_irq_installed = true;
 }
 
 static mp_obj_t network_ppp_config(size_t n_args, const mp_obj_t *args, mp_map_t *kwargs) {
@@ -317,6 +434,8 @@ static mp_obj_t network_ppp_connect(size_t n_args, const mp_obj_t *args, mp_map_
         if (self->pcb == NULL) {
             mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("pppos_create failed"));
         }
+        // From here on lwIP holds a pointer to self->netif: keep the object alive.
+        network_ppp_list_add(self);
         self->state = STATE_ACTIVE;
 
         network_ppp_stream_uart_irq_enable(self);
@@ -353,8 +472,11 @@ static mp_obj_t network_ppp_connect(size_t n_args, const mp_obj_t *args, mp_map_
 
     self->state = STATE_CONNECTING;
 
-    // Do a poll in case there is data waiting on the input stream.
-    network_ppp_poll(1, args);
+    if (!self->c_sink_installed) {
+        // Do a poll in case there is data waiting on the input stream.
+        // With a C sink the stream's own task is already draining it.
+        network_ppp_poll(1, args);
+    }
 
     return mp_const_none;
 }
@@ -458,6 +580,8 @@ static mp_obj_t network_ppp_active(size_t n_args, const mp_obj_t *args) {
             if (self->pcb == NULL) {
                 mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("pppos_create failed"));
             }
+            // lwIP now holds a pointer to self->netif; keep the object alive.
+            network_ppp_list_add(self);
             self->state = STATE_ACTIVE;
 
             network_ppp_stream_uart_irq_enable(self);
@@ -467,11 +591,70 @@ static mp_obj_t network_ppp_active(size_t n_args, const mp_obj_t *args) {
             }
 
             network_ppp___del__(MP_OBJ_FROM_PTR(self));
+            network_ppp_reap();
         }
     }
     return mp_obj_new_bool(self->state >= STATE_ACTIVE);
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(network_ppp_active_obj, 1, 2, network_ppp_active);
+
+// Tear one session down far enough that lwIP no longer references memory owned
+// by the MicroPython heap. Must not raise: it runs from the soft-reset path,
+// outside any nlr handler.
+static void network_ppp_force_close(network_ppp_obj_t *self) {
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        network_ppp_stream_uart_irq_disable(self);
+        nlr_pop();
+    }
+    // Stop the output callback from calling back into a VM that is being torn down.
+    self->stream = mp_const_none;
+
+    if (self->pcb != NULL && self->state >= STATE_ERROR) {
+        // nocarrier=1: do not wait for the peer, we are shutting down. The status
+        // callback then runs ppp_free() -> netif_remove() on the lwIP thread.
+        pppapi_close(self->pcb, 1);
+        for (int i = 0; i < 200 && self->pcb != NULL; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+    if (self->pcb != NULL && pppapi_free(self->pcb) == ERR_OK) {
+        self->pcb = NULL;
+    }
+    if (self->pcb != NULL) {
+        // The pcb is wedged. Leaking it is survivable; leaving a netif that
+        // points into about-to-be-recycled heap in lwIP's global list is not.
+        netifapi_netif_remove(&self->netif);
+        #if NETWORK_PPP_DEINIT_TRACE
+        mp_printf(&mp_plat_print, "[ppp] deinit_all: forced netif_remove\n");
+        #endif
+    }
+    #if NETWORK_PPP_DEINIT_TRACE
+    mp_printf(&mp_plat_print, "[ppp] deinit_all: closed, pcb=%p state=%d\n", self->pcb, self->state);
+    #endif
+    self->state = STATE_INACTIVE;
+}
+
+// Called from the soft-reset path, BEFORE machine_uart_deinit_all(): detaching
+// the stream IRQ needs the UART object to still be usable.
+void network_ppp_deinit_all(void) {
+    network_ppp_obj_t *self = MP_STATE_PORT(network_ppp_obj_head);
+    MP_STATE_PORT(network_ppp_obj_head) = NULL;
+    #if NETWORK_PPP_DEINIT_TRACE
+    int n = 0;
+    for (network_ppp_obj_t *t = self; t; t = t->next) {
+        n++;
+    }
+    mp_printf(&mp_plat_print, "[ppp] deinit_all: %d live session(s)\n", n);
+    #endif
+    while (self != NULL) {
+        network_ppp_obj_t *next = self->next;
+        self->next = NULL;
+        self->listed = false;
+        network_ppp_force_close(self);
+        self = next;
+    }
+}
 
 static const mp_rom_map_elem_t network_ppp_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&network_ppp___del___obj) },
@@ -505,3 +688,5 @@ MP_DEFINE_CONST_OBJ_TYPE(
     );
 
 #endif
+
+MP_REGISTER_ROOT_POINTER(struct _network_ppp_obj_t *network_ppp_obj_head);

@@ -197,6 +197,13 @@ soft_reset_exit:
     wifi_csi_deinit();
     #endif
 
+    // Must match the guard in network_ppp.c.
+    #if defined(CONFIG_ESP_NETIF_TCPIP_LWIP) && defined(CONFIG_LWIP_PPP_SUPPORT)
+    // Before the UART deinit: PPP detaches its stream IRQ through the stream
+    // object, and it must leave lwIP's netif_list before the GC heap is recycled.
+    network_ppp_deinit_all();
+    #endif
+
     #if MICROPY_PY_MACHINE_UART
     machine_uart_deinit_all();
     #endif
