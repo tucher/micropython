@@ -47,6 +47,21 @@
 #define MP_STREAM_GET_BUFFER_SIZE   (11) // Get preferred buffer size for file
 #if MICROPY_STREAMS_DELEGATE_ERROR
 #define MP_STREAM_RAISE_ERROR       (12) // Raise an error with detailed error string
+#define MP_STREAM_SET_DATA_SINK     (13) // Push incoming data to a C callback
+
+// Argument to MP_STREAM_SET_DATA_SINK. A stream that implements this request
+// delivers incoming data by calling `handler` directly from whatever context
+// notices the data, instead of going through the MicroPython scheduler. That
+// lets a C consumer (for example the PPP driver) keep receiving while the VM is
+// blocked. Set `handler` to NULL to go back to normal buffered operation.
+//
+// The handler may run on another thread/task and must not call into the VM.
+typedef void (*mp_stream_data_sink_t)(void *ctx, const uint8_t *buf, size_t len);
+
+typedef struct _mp_stream_data_sink_t_cfg {
+    mp_stream_data_sink_t handler;
+    void *ctx;
+} mp_stream_data_sink_cfg_t;
 #endif
 
 // These poll ioctl values are compatible with Linux

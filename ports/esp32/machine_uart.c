@@ -120,6 +120,13 @@ typedef struct _machine_uart_obj_t {
     mp_irq_obj_t *mp_irq_obj;  // user IRQ object
     machine_timer_obj_t *rxidle_timer;
     uint8_t rxidle_state;
+    // Optional C-level consumer of incoming data (MP_STREAM_SET_DATA_SINK).
+    // When set, uart_event_task hands bytes straight to it and skips the
+    // RXIDLE timer and the Python IRQ entirely.
+    mp_stream_data_sink_t c_sink;
+    void *c_sink_ctx;
+    volatile bool c_sink_running;   // set while inside the callback
+    volatile uint32_t rx_overrun;   // FIFO overflows + ring-buffer-full events
 } machine_uart_obj_t;
 
 static const char *_parity_name[] = {"None", "1", "0"};
@@ -174,6 +181,23 @@ static void uart_event_task(void *self_in) {
             switch (event.type) {
                 // Event of UART receiving data
                 case UART_DATA:
+                    if (self->c_sink != NULL) {
+                        // C consumer: drain the driver here and now. No timer,
+                        // no scheduler, no dependency on the VM making progress.
+                        uint8_t buf[256];
+                        self->c_sink_running = true;
+                        mp_stream_data_sink_t sink = self->c_sink;
+                        while (sink != NULL) {
+                            int n = uart_read_bytes(self->uart_num, buf, sizeof(buf), 0);
+                            if (n <= 0) {
+                                break;
+                            }
+                            sink(self->c_sink_ctx, buf, n);
+                            sink = self->c_sink;
+                        }
+                        self->c_sink_running = false;
+                        break;
+                    }
                     if (self->mp_irq_trigger & UART_IRQ_RXIDLE) {
                         if (self->rxidle_state == RXIDLE_STANDBY) {
                             machine_timer_start(self->rxidle_timer);
@@ -184,6 +208,12 @@ static void uart_event_task(void *self_in) {
                     break;
                 case UART_BREAK:
                     mp_irq_flags |= UART_IRQ_BREAK;
+                    break;
+                case UART_FIFO_OVF:
+                case UART_BUFFER_FULL:
+                    // Previously discarded silently, which made lost bytes
+                    // impossible to diagnose from Python.
+                    self->rx_overrun++;
                     break;
                 default:
                     break;
@@ -212,6 +242,7 @@ static void mp_machine_uart_print(const mp_print_t *print, mp_obj_t self_in, mp_
     mp_printf(print, "UART(%u, baudrate=%u, bits=%u, parity=%s, stop=%u, tx=%d, rx=%d, rts=%d, cts=%d, txbuf=%u, rxbuf=%u, timeout=%u, timeout_char=%u, irq=%d",
         self->uart_num, baudrate, self->bits, _parity_name[self->parity],
         self->stop, self->tx, self->rx, self->rts, self->cts, self->txbuf, self->rxbuf, self->timeout, self->timeout_char, self->mp_irq_trigger);
+    mp_printf(print, ", rxovf=%u", self->rx_overrun);
     if (self->invert) {
         mp_printf(print, ", invert=");
         uint32_t invert_mask = self->invert;
@@ -488,6 +519,10 @@ static mp_obj_t mp_machine_uart_make_new(const mp_obj_type_t *type, size_t n_arg
         // Allocate a new UART object
         self = mp_obj_malloc(machine_uart_obj_t, &machine_uart_type);
         self->uart_num = uart_num;
+        self->c_sink = NULL;
+        self->c_sink_ctx = NULL;
+        self->c_sink_running = false;
+        self->rx_overrun = 0;
         // remaining fields are set from inside mp_machine_uart_init_helper()
     }
 
@@ -738,6 +773,24 @@ static mp_uint_t mp_machine_uart_ioctl(mp_obj_t self_in, mp_uint_t request, uint
             *errcode = MP_ETIMEDOUT;
             ret = MP_STREAM_ERROR;
         }
+    } else if (request == MP_STREAM_SET_DATA_SINK) {
+        mp_stream_data_sink_cfg_t *cfg = (mp_stream_data_sink_cfg_t *)arg;
+        if (cfg->handler == NULL) {
+            self->c_sink = NULL;
+            // Wait for an in-flight callback to finish before the caller frees
+            // anything the sink context points at.
+            for (int i = 0; i < 100 && self->c_sink_running; ++i) {
+                vTaskDelay(1);
+            }
+            self->c_sink_ctx = NULL;
+        } else {
+            if (self->uart_event_task == NULL) {
+                uart_event_task_create(self);
+            }
+            self->c_sink_ctx = cfg->ctx;
+            self->c_sink = cfg->handler;
+        }
+        ret = 0;
     } else {
         *errcode = MP_EINVAL;
         ret = MP_STREAM_ERROR;

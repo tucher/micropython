@@ -97,6 +97,9 @@ static inline void esp_exceptions(esp_err_t e) {
 }
 
 void socket_events_deinit(void);
+#if defined(CONFIG_ESP_NETIF_TCPIP_LWIP) && defined(CONFIG_LWIP_PPP_SUPPORT)
+void network_ppp_deinit_all(void);
+#endif
 void esp_initialise_wifi(void);
 
 #endif
