@@ -118,6 +118,10 @@ typedef struct _network_ppp_obj_t {
     // our own flag needs neither the VM nor another GC object, where reaching
     // the stream to detach the sink needed both. See network_ppp_status_cb().
     volatile bool sink_muted;
+    // Set by the status callback once lwIP has taken the session to the dead
+    // phase, which is the only phase in which ppp_free() may be called. The
+    // callback no longer frees the pcb itself -- see network_ppp_teardown().
+    volatile bool pcb_dead;
 } network_ppp_obj_t;
 
 static void network_ppp_list_add(network_ppp_obj_t *self) {
@@ -146,6 +150,8 @@ static void network_ppp_reap(void) {
 }
 
 const mp_obj_type_t esp_network_ppp_lwip_type;
+
+static void network_ppp_teardown(network_ppp_obj_t *self, bool shutdown);
 
 // Receive path when the stream supports a C sink. Runs on the stream's own
 // task (for machine.UART: uart_event_task), never on the MicroPython thread, so
@@ -213,6 +219,7 @@ static void network_ppp_stream_uart_irq_disable(network_ppp_obj_t *self) {
 // detach happens on the MicroPython thread, where every other caller of
 // network_ppp_stream_uart_irq_disable() already lives.
 static void network_ppp_status_cb(ppp_pcb *pcb, int err_code, void *ctx) {
+    (void)pcb;
     network_ppp_obj_t *self = ctx;
     switch (err_code) {
         case PPPERR_NONE:
@@ -224,15 +231,16 @@ static void network_ppp_status_cb(ppp_pcb *pcb, int err_code, void *ctx) {
                 // only need to free the PPP PCB, not close it.
                 self->state = STATE_ACTIVE;
             }
+            // Mark, do not free. Freeing here means freeing on the lwIP
+            // thread while the C sink may already have read self->pcb and be
+            // about to hand it to pppos_input_tcpip() -- and since that call
+            // queues a message, even one queued earlier would land after the
+            // free. lwIP's own contract says ppp_free() is the final destroy
+            // and a closed pcb may simply be reconnected, so there is no
+            // reason to do it here. network_ppp_teardown() does it, on the
+            // MicroPython thread, after detaching the sink.
             self->sink_muted = true;
-            // Clean up the PPP PCB.
-            // Note: Because we use pppapi_close instead of ppp_close, this
-            // callback will run on the lwIP tcpip_thread, thus to prevent a
-            // deadlock we must use the non-threadsafe function here.
-            if (ppp_free(pcb) == ERR_OK) {
-                self->state = STATE_INACTIVE;
-                self->pcb = NULL;
-            }
+            self->pcb_dead = true;
             break;
         default:
             self->state = STATE_ERROR;
@@ -261,6 +269,7 @@ static mp_obj_t network_ppp_make_new(const mp_obj_type_t *type, size_t n_args, s
     self->c_sink_installed = false;
     self->py_irq_installed = false;
     self->sink_muted = false;
+    self->pcb_dead = false;
     self->c_writer.write = NULL;
     self->c_writer.ctx = NULL;
     self->c_writer.max_write = 0;
@@ -269,20 +278,12 @@ static mp_obj_t network_ppp_make_new(const mp_obj_type_t *type, size_t n_args, s
 }
 
 static mp_obj_t network_ppp___del__(mp_obj_t self_in) {
-    network_ppp_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    network_ppp_stream_uart_irq_disable(self);
-    if (self->state >= STATE_ERROR) {
-        // Still connected over the stream.
-        // Force the connection to close, with nocarrier=1.
-        pppapi_close(self->pcb, 1);
-    } else if (self->state >= STATE_ACTIVE) {
-        // Free PPP PCB and reset state.
-        if (pppapi_free(self->pcb) != ERR_OK) {
-            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("pppapi_free failed"));
-        }
-        self->state = STATE_INACTIVE;
-        self->pcb = NULL;
-    }
+    // Also the GC finaliser. That is safe only because a session holding a pcb
+    // is on the root list and so never collected, and because the soft-reset
+    // path runs network_ppp_deinit_all() before gc_sweep_all() -- so by the
+    // time a finaliser sees this object the pcb is already gone and teardown
+    // returns at once.
+    network_ppp_teardown(MP_OBJ_TO_PTR(self_in), false);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(network_ppp___del___obj, network_ppp___del__);
@@ -492,6 +493,7 @@ static mp_obj_t network_ppp_connect(size_t n_args, const mp_obj_t *args, mp_map_
         }
         // From here on lwIP holds a pointer to self->netif: keep the object alive.
         network_ppp_list_add(self);
+        self->pcb_dead = false;
         self->state = STATE_ACTIVE;
 
         network_ppp_stream_uart_irq_enable(self);
@@ -638,6 +640,7 @@ static mp_obj_t network_ppp_active(size_t n_args, const mp_obj_t *args) {
             }
             // lwIP now holds a pointer to self->netif; keep the object alive.
             network_ppp_list_add(self);
+            self->pcb_dead = false;
             self->state = STATE_ACTIVE;
 
             network_ppp_stream_uart_irq_enable(self);
@@ -657,37 +660,81 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(network_ppp_active_obj, 1, 2, network
 // Tear one session down far enough that lwIP no longer references memory owned
 // by the MicroPython heap. Must not raise: it runs from the soft-reset path,
 // outside any nlr handler.
-static void network_ppp_force_close(network_ppp_obj_t *self) {
+// The tcpip mailbox is FIFO, so once a message posted here has been processed,
+// everything the sink queued ahead of it has been too. The sequence number
+// makes a timed-out barrier harmless: its late callback publishes a number no
+// later wait is looking for. Only ever used from the MicroPython thread.
+static volatile uint32_t network_ppp_barrier_seq;
+static volatile uint32_t network_ppp_barrier_done;
+
+static void network_ppp_barrier_cb(void *ctx) {
+    network_ppp_barrier_done = (uint32_t)(uintptr_t)ctx;
+}
+
+static void network_ppp_drain_tcpip(void) {
+    uint32_t seq = ++network_ppp_barrier_seq;
+    if (tcpip_callback(network_ppp_barrier_cb, (void *)(uintptr_t)seq) != ERR_OK) {
+        // Could not post. Pausing is a poor substitute for the barrier, but it
+        // beats freeing immediately behind input that may still be queued.
+        vTaskDelay(pdMS_TO_TICKS(50));
+        return;
+    }
+    for (int i = 0; i < 200 && network_ppp_barrier_done != seq; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+// The one place a pcb is freed. Runs on the MicroPython thread, where blocking
+// is allowed, which is what makes the order below possible:
+//
+//   detach the sink   -- the UART ioctl waits for a callback already running,
+//                        so afterwards nothing new can be queued;
+//   drain tcpip       -- so nothing queued earlier is still in flight;
+//   free.
+//
+// `shutdown` is for the soft-reset path, which must also stop the output
+// callback reaching a VM that is being torn down. Must not raise: it is called
+// from outside any nlr handler.
+static void network_ppp_teardown(network_ppp_obj_t *self, bool shutdown) {
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
         network_ppp_stream_uart_irq_disable(self);
         nlr_pop();
     }
-    // Stop the output callback from calling back into a VM that is being torn down.
-    self->stream = mp_const_none;
+    if (shutdown) {
+        self->stream = mp_const_none;
+    }
 
-    if (self->pcb != NULL && self->state >= STATE_ERROR) {
-        // nocarrier=1: do not wait for the peer, we are shutting down. The status
-        // callback then runs ppp_free() -> netif_remove() on the lwIP thread.
+    if (self->pcb == NULL) {
+        self->state = STATE_INACTIVE;
+        return;
+    }
+
+    if (self->state >= STATE_ERROR && !self->pcb_dead) {
+        // nocarrier=1: do not wait for the peer. The status callback marks the
+        // session dead; it does not free it.
         pppapi_close(self->pcb, 1);
-        for (int i = 0; i < 200 && self->pcb != NULL; ++i) {
+        for (int i = 0; i < 200 && !self->pcb_dead; ++i) {
             vTaskDelay(pdMS_TO_TICKS(5));
         }
     }
-    if (self->pcb != NULL && pppapi_free(self->pcb) == ERR_OK) {
+
+    network_ppp_drain_tcpip();
+
+    if (pppapi_free(self->pcb) == ERR_OK) {
         self->pcb = NULL;
-    }
-    if (self->pcb != NULL) {
-        // The pcb is wedged. Leaking it is survivable; leaving a netif that
-        // points into about-to-be-recycled heap in lwIP's global list is not.
+    } else {
+        // Wedged. Leaking the pcb is survivable; leaving a netif that points
+        // into the MicroPython heap in lwIP's global list is not.
         netifapi_netif_remove(&self->netif);
         #if NETWORK_PPP_DEINIT_TRACE
-        mp_printf(&mp_plat_print, "[ppp] deinit_all: forced netif_remove\n");
+        mp_printf(&mp_plat_print, "[ppp] teardown: forced netif_remove\n");
         #endif
     }
     #if NETWORK_PPP_DEINIT_TRACE
-    mp_printf(&mp_plat_print, "[ppp] deinit_all: closed, pcb=%p state=%d\n", self->pcb, self->state);
+    mp_printf(&mp_plat_print, "[ppp] teardown: pcb=%p state=%d\n", self->pcb, self->state);
     #endif
+    self->pcb_dead = false;
     self->state = STATE_INACTIVE;
 }
 
@@ -707,7 +754,7 @@ void network_ppp_deinit_all(void) {
         network_ppp_obj_t *next = self->next;
         self->next = NULL;
         self->listed = false;
-        network_ppp_force_close(self);
+        network_ppp_teardown(self, true);
         self = next;
     }
 }
