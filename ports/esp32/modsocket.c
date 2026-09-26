@@ -940,7 +940,13 @@ static mp_uint_t socket_stream_ioctl(mp_obj_t self_in, mp_uint_t request, uintpt
             FD_SET(socket->fd, &efds);
         }
 
-        int r = select((socket->fd) + 1, &rfds, &wfds, &efds, &timeout);
+        // lwip_select() rather than select(): with LWIP_COMPAT_SOCKETS == 0 the
+        // latter resolves to esp_vfs_select(), which allocates twice, takes the
+        // global fd-table lock and walks every registered VFS driver before it
+        // reaches lwIP -- measured at ~2.1 ms for this single-fd call, paid on
+        // every poll of every socket. The fd is the same number either way:
+        // LWIP_SOCKET_OFFSET is applied inside lwIP.
+        int r = lwip_select((socket->fd) + 1, &rfds, &wfds, &efds, &timeout);
         if (r < 0) {
             *errcode = MP_EIO;
             return MP_STREAM_ERROR;
