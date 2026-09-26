@@ -79,7 +79,10 @@ typedef struct _socket_obj_t {
     uint8_t type;
     uint8_t proto;
     uint8_t state;
-    unsigned int retries;
+    // 0 = non-blocking, UINT64_MAX = block indefinitely, otherwise the
+    // caller's timeout in milliseconds. Kept as the caller gave it rather
+    // than as a retry count, so it can actually be honoured.
+    uint64_t timeout_ms;
     #if MICROPY_PY_SOCKET_EVENTS
     mp_obj_t events_callback;
     struct _socket_obj_t *events_next;
@@ -157,6 +160,25 @@ void socket_events_handler(void) {
 
 static inline void check_for_exceptions(void) {
     mp_handle_pending(MP_HANDLE_PENDING_CALLBACKS_AND_EXCEPTIONS);
+}
+
+// Blocking operations poll in SOCKET_POLL_US slices so that a pending
+// KeyboardInterrupt is noticed, but the caller's timeout is tracked separately
+// against the clock. Deriving a retry count from the polling period, as this
+// used to, rounded every timeout up to a multiple of it and made any timeout
+// shorter than one period indistinguishable from a non-blocking socket.
+static bool socket_timed_out(socket_obj_t *sock, mp_uint_t start_ticks) {
+    if (sock->timeout_ms == UINT64_MAX) {
+        return false;
+    }
+    if (sock->timeout_ms == 0) {
+        return true;    // non-blocking: one attempt is all it gets
+    }
+    return (uint64_t)(mp_hal_ticks_ms() - start_ticks) >= sock->timeout_ms;
+}
+
+static int socket_timeout_errno(socket_obj_t *sock) {
+    return sock->timeout_ms == 0 ? MP_EWOULDBLOCK : MP_ETIMEDOUT;
 }
 
 #if MICROPY_HW_ENABLE_MDNS_QUERIES
@@ -349,7 +371,8 @@ static mp_obj_t socket_accept(const mp_obj_t arg0) {
     socklen_t addr_len = sizeof(addr);
 
     int new_fd = -1;
-    for (int i = 0; i <= self->retries; i++) {
+    mp_uint_t start_ticks = mp_hal_ticks_ms();
+    for (;;) {
         MP_THREAD_GIL_EXIT();
         new_fd = lwip_accept(self->fd, &addr, &addr_len);
         MP_THREAD_GIL_ENTER();
@@ -359,14 +382,10 @@ static mp_obj_t socket_accept(const mp_obj_t arg0) {
         if (errno != EAGAIN) {
             mp_raise_OSError(errno);
         }
-        check_for_exceptions();
-    }
-    if (new_fd < 0) {
-        if (self->retries == 0) {
-            mp_raise_OSError(MP_EAGAIN);
-        } else {
-            mp_raise_OSError(MP_ETIMEDOUT);
+        if (socket_timed_out(self, start_ticks)) {
+            mp_raise_OSError(socket_timeout_errno(self));
         }
+        check_for_exceptions();
     }
 
     // create new socket object
@@ -443,9 +462,8 @@ static mp_obj_t socket_connect(const mp_obj_t arg0, const mp_obj_t arg1) {
         // Keep calling select() until the socket is marked writable (i.e. connected),
         // or an error or a timeout occurs
 
-        // Note: _socket_settimeout() always sets self->retries != 0 on blocking sockets.
-
-        for (unsigned int i = 0; i <= self->retries; i++) {
+        mp_uint_t start_ticks = mp_hal_ticks_ms();
+        for (;;) {
             struct timeval timeout = {
                 .tv_sec = 0,
                 .tv_usec = SOCKET_POLL_US,
@@ -468,10 +486,14 @@ static mp_obj_t socket_connect(const mp_obj_t arg0, const mp_obj_t arg1) {
                 }
                 break;
             } else {
-                // Select timed out
-                raise_err = ETIMEDOUT;
-
+                // Select timed out for this slice; only give up once the
+                // caller's own timeout has actually elapsed.
                 MP_THREAD_GIL_ENTER();
+                if (socket_timed_out(self, start_ticks)) {
+                    raise_err = ETIMEDOUT;
+                    MP_THREAD_GIL_EXIT();
+                    break;
+                }
                 check_for_exceptions();
                 MP_THREAD_GIL_EXIT();
             }
@@ -570,15 +592,20 @@ static mp_obj_t socket_setsockopt(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(socket_setsockopt_obj, 4, 4, socket_setsockopt);
 
 void _socket_settimeout(socket_obj_t *sock, uint64_t timeout_ms) {
-    // Rather than waiting for the entire timeout specified, we wait sock->retries times
-    // for SOCKET_POLL_US each, checking for a MicroPython interrupt between timeouts.
-    // with SOCKET_POLL_MS == 100ms, sock->retries allows for timeouts up to 13 years.
-    // if timeout_ms == UINT64_MAX, wait forever.
-    sock->retries = (timeout_ms == UINT64_MAX) ? UINT_MAX : timeout_ms * 1000 / SOCKET_POLL_US;
+    // Blocking calls are made in slices so a MicroPython interrupt is noticed
+    // between them; the slice is the shorter of the polling period and what the
+    // caller actually asked for, so a timeout below one period is not rounded up.
+    sock->timeout_ms = timeout_ms;
 
+    uint64_t slice_us = SOCKET_POLL_US;
+    if (timeout_ms == 0) {
+        slice_us = 0;
+    } else if (timeout_ms != UINT64_MAX && timeout_ms * 1000 < SOCKET_POLL_US) {
+        slice_us = timeout_ms * 1000;
+    }
     struct timeval timeout = {
         .tv_sec = 0,
-        .tv_usec = timeout_ms ? SOCKET_POLL_US : 0
+        .tv_usec = slice_us
     };
     lwip_setsockopt(sock->fd, SOL_SOCKET, SO_SNDTIMEO, (const void *)&timeout, sizeof(timeout));
     lwip_setsockopt(sock->fd, SOL_SOCKET, SO_RCVTIMEO, (const void *)&timeout, sizeof(timeout));
@@ -632,8 +659,8 @@ static mp_uint_t _socket_read_data(mp_obj_t self_in, void *buf, size_t size, mp_
         return 0;
     }
 
-    // XXX Would be nicer to use RTC to handle timeouts
-    for (int i = 0; i <= sock->retries; ++i) {
+    mp_uint_t start_ticks = mp_hal_ticks_ms();
+    for (;;) {
         // Poll the socket to see if it has waiting data and only release the GIL if it doesn't.
         // This ensures higher performance in the case of many small reads, eg for readline.
         bool release_gil;
@@ -662,11 +689,12 @@ static mp_uint_t _socket_read_data(mp_obj_t self_in, void *buf, size_t size, mp_
             *errcode = errno;
             return MP_STREAM_ERROR;
         }
+        if (socket_timed_out(sock, start_ticks)) {
+            *errcode = socket_timeout_errno(sock);
+            return MP_STREAM_ERROR;
+        }
         check_for_exceptions();
     }
-
-    *errcode = sock->retries == 0 ? MP_EWOULDBLOCK : MP_ETIMEDOUT;
-    return MP_STREAM_ERROR;
 }
 
 mp_obj_t _socket_recvfrom(size_t n_args, const mp_obj_t *args,
@@ -710,7 +738,8 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(socket_recvfrom_obj, 2, 3, socket_rec
 
 int _socket_send(socket_obj_t *sock, const char *data, size_t datalen) {
     int sentlen = 0;
-    for (int i = 0; i <= sock->retries && sentlen < datalen; i++) {
+    mp_uint_t start_ticks = mp_hal_ticks_ms();
+    while (sentlen < datalen) {
         MP_THREAD_GIL_EXIT();
         int r = lwip_write(sock->fd, data + sentlen, datalen - sentlen);
         MP_THREAD_GIL_ENTER();
@@ -720,11 +749,15 @@ int _socket_send(socket_obj_t *sock, const char *data, size_t datalen) {
         }
         if (r > 0) {
             sentlen += r;
+            continue;
+        }
+        if (socket_timed_out(sock, start_ticks)) {
+            break;
         }
         check_for_exceptions();
     }
     if (sentlen == 0) {
-        mp_raise_OSError(sock->retries == 0 ? MP_EWOULDBLOCK : MP_ETIMEDOUT);
+        mp_raise_OSError(socket_timeout_errno(sock));
     }
     return sentlen;
 }
@@ -766,7 +799,8 @@ static mp_obj_t socket_sendto(mp_obj_t self_in, mp_obj_t data_in, mp_obj_t addr_
     to.sin_port = lwip_htons(netutils_parse_inet_addr(addr_in, (uint8_t *)&to.sin_addr, NETUTILS_BIG));
 
     // send the data
-    for (int i = 0; i <= self->retries; i++) {
+    mp_uint_t start_ticks = mp_hal_ticks_ms();
+    for (;;) {
         MP_THREAD_GIL_EXIT();
         int ret = lwip_sendto(self->fd, bufinfo.buf, bufinfo.len, 0, (struct sockaddr *)&to, sizeof(to));
         MP_THREAD_GIL_ENTER();
@@ -776,9 +810,11 @@ static mp_obj_t socket_sendto(mp_obj_t self_in, mp_obj_t data_in, mp_obj_t addr_
         if (ret == -1 && errno != EWOULDBLOCK) {
             mp_raise_OSError(errno);
         }
+        if (socket_timed_out(self, start_ticks)) {
+            mp_raise_OSError(socket_timeout_errno(self));
+        }
         check_for_exceptions();
     }
-    mp_raise_OSError(MP_ETIMEDOUT);
 }
 static MP_DEFINE_CONST_FUN_OBJ_3(socket_sendto_obj, socket_sendto);
 
@@ -800,7 +836,8 @@ static mp_uint_t socket_stream_read(mp_obj_t self_in, void *buf, mp_uint_t size,
 
 static mp_uint_t socket_stream_write(mp_obj_t self_in, const void *buf, mp_uint_t size, int *errcode) {
     socket_obj_t *sock = self_in;
-    for (int i = 0; i <= sock->retries; i++) {
+    mp_uint_t start_ticks = mp_hal_ticks_ms();
+    for (;;) {
         MP_THREAD_GIL_EXIT();
         int r = lwip_write(sock->fd, buf, size);
         MP_THREAD_GIL_ENTER();
@@ -812,10 +849,12 @@ static mp_uint_t socket_stream_write(mp_obj_t self_in, const void *buf, mp_uint_
             *errcode = errno;
             return MP_STREAM_ERROR;
         }
+        if (socket_timed_out(sock, start_ticks)) {
+            *errcode = socket_timeout_errno(sock);
+            return MP_STREAM_ERROR;
+        }
         check_for_exceptions();
     }
-    *errcode = sock->retries == 0 ? MP_EWOULDBLOCK : MP_ETIMEDOUT;
-    return MP_STREAM_ERROR;
 }
 
 static mp_uint_t socket_stream_ioctl(mp_obj_t self_in, mp_uint_t request, uintptr_t arg, int *errcode) {
