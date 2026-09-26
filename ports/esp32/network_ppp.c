@@ -41,6 +41,7 @@
 #include "freertos/task.h"
 
 #include "lwip/dns.h"
+#include "lwip/pbuf.h"
 #include "lwip/netifapi.h"
 #include "netif/ppp/ppp.h"
 #include "netif/ppp/pppapi.h"
@@ -52,6 +53,15 @@
 
 // Enable to trace what network_ppp_deinit_all() does at soft reset.
 #define NETWORK_PPP_DEINIT_TRACE (0)
+
+// Smallest C writer worth using. pppos builds its output in a buffer of
+// PBUF_POOL_BUFSIZE and flushes it to the output callback when it fills or the
+// frame ends, so that is the largest single write it can ask for -- measured
+// at 1446 bytes while uploading, against 129 while downloading, where all we
+// send is ACKs. A short write is an error to pppos and the frame is dropped,
+// so a writer that cannot take that much loses every outbound data frame
+// while a download still looks fine. Refuse it and use the blocking path.
+#define NETWORK_PPP_MIN_C_WRITER (PBUF_POOL_BUFSIZE)
 
 // Enable this to see the serial data going between the PPP layer.
 #define PPP_TRACE_IN_OUT (0)
@@ -103,6 +113,11 @@ typedef struct _network_ppp_obj_t {
     // and calling the stream's .irq() method from there enters the VM and can
     // allocate GC memory. See the note above network_ppp_status_cb().
     bool py_irq_installed;
+    // Set from the lwIP thread to stop the C sink feeding a pcb that is on its
+    // way out. It is the only thing that callback is allowed to touch: writing
+    // our own flag needs neither the VM nor another GC object, where reaching
+    // the stream to detach the sink needed both. See network_ppp_status_cb().
+    volatile bool sink_muted;
 } network_ppp_obj_t;
 
 static void network_ppp_list_add(network_ppp_obj_t *self) {
@@ -138,6 +153,9 @@ const mp_obj_type_t esp_network_ppp_lwip_type;
 // the VM. pppos_input_tcpip() is the thread-safe lwIP entry point.
 static void network_ppp_data_sink(void *ctx, const uint8_t *buf, size_t len) {
     network_ppp_obj_t *self = ctx;
+    if (self->sink_muted) {
+        return;
+    }
     ppp_pcb *pcb = self->pcb;
     if (pcb != NULL && self->state >= STATE_ACTIVE) {
         pppos_input_tcpip(pcb, (u8_t *)buf, len);
@@ -166,6 +184,7 @@ static void network_ppp_stream_uart_irq_disable(network_ppp_obj_t *self) {
 
     self->c_writer.write = NULL;
     self->c_writer.ctx = NULL;
+    self->c_writer.max_write = 0;
 
     if (self->c_sink_installed) {
         network_ppp_set_data_sink(self, false);
@@ -185,12 +204,14 @@ static void network_ppp_stream_uart_irq_disable(network_ppp_obj_t *self) {
     mp_call_method_n_kw(1, 0, dest);
 }
 
-// NOTE: this runs on the lwIP tcpip thread, not the MicroPython thread. Anything
-// it calls must stay out of the VM: network_ppp_stream_uart_irq_disable() below
-// is safe only because the C-sink path is pure C and the Python fallback path is
-// guarded by py_irq_installed (it has already run on the MicroPython thread by
-// the time we get here). Reaching the stream's .irq() method from this context
-// allocates GC memory from the wrong thread and crashes in gc_alloc().
+// NOTE: this runs on the lwIP tcpip thread, not the MicroPython thread, so it
+// must not enter the VM or touch another GC object. It used to call
+// network_ppp_stream_uart_irq_disable() here, which reached the stream through
+// mp_get_stream() and then blocked this thread in the UART's ioctl waiting for
+// an in-flight sink callback -- both wrong from here, and the second one stalls
+// all of lwIP. It now only sets sink_muted, which is our own memory; the actual
+// detach happens on the MicroPython thread, where every other caller of
+// network_ppp_stream_uart_irq_disable() already lives.
 static void network_ppp_status_cb(ppp_pcb *pcb, int err_code, void *ctx) {
     network_ppp_obj_t *self = ctx;
     switch (err_code) {
@@ -203,7 +224,7 @@ static void network_ppp_status_cb(ppp_pcb *pcb, int err_code, void *ctx) {
                 // only need to free the PPP PCB, not close it.
                 self->state = STATE_ACTIVE;
             }
-            network_ppp_stream_uart_irq_disable(self);
+            self->sink_muted = true;
             // Clean up the PPP PCB.
             // Note: Because we use pppapi_close instead of ppp_close, this
             // callback will run on the lwIP tcpip_thread, thus to prevent a
@@ -239,8 +260,10 @@ static mp_obj_t network_ppp_make_new(const mp_obj_type_t *type, size_t n_args, s
     self->listed = false;
     self->c_sink_installed = false;
     self->py_irq_installed = false;
+    self->sink_muted = false;
     self->c_writer.write = NULL;
     self->c_writer.ctx = NULL;
+    self->c_writer.max_write = 0;
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -304,16 +327,20 @@ static void network_ppp_stream_uart_irq_enable(network_ppp_obj_t *self) {
     // MicroPython scheduler getting a turn.
     if (network_ppp_set_data_sink(self, true)) {
         self->c_sink_installed = true;
+        self->sink_muted = false;
         // Ask for the matching outbound path. Optional: a stream may support
         // the sink but not the writer (e.g. a UART with no TX ring buffer).
         const mp_stream_p_t *stream_p = mp_get_stream(self->stream);
-        mp_stream_c_writer_t writer = { NULL, NULL };
+        mp_stream_c_writer_t writer = { NULL, NULL, 0 };
         int errcode = 0;
         if (stream_p != NULL && stream_p->ioctl != NULL
             && stream_p->ioctl(self->stream, MP_STREAM_GET_C_WRITER,
-                (uintptr_t)&writer, &errcode) != MP_STREAM_ERROR) {
+                (uintptr_t)&writer, &errcode) != MP_STREAM_ERROR
+            && writer.max_write >= NETWORK_PPP_MIN_C_WRITER) {
             self->c_writer = writer;
         }
+        // Otherwise c_writer stays empty and network_ppp_output_callback()
+        // uses the stream protocol, which blocks but does not lose frames.
         return;
     }
 
