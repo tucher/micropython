@@ -128,6 +128,7 @@ typedef struct _machine_uart_obj_t {
     volatile bool c_sink_running;   // set while inside the callback
     volatile uint32_t rx_overrun;   // FIFO overflows + ring-buffer-full events
     volatile uint32_t tx_congested; // writes refused because the TX ring was full
+    volatile uint16_t tx_max_write;  // largest single write the C writer was asked for
 } machine_uart_obj_t;
 
 static const char *_parity_name[] = {"None", "1", "0"};
@@ -243,7 +244,8 @@ static void mp_machine_uart_print(const mp_print_t *print, mp_obj_t self_in, mp_
     mp_printf(print, "UART(%u, baudrate=%u, bits=%u, parity=%s, stop=%u, tx=%d, rx=%d, rts=%d, cts=%d, txbuf=%u, rxbuf=%u, timeout=%u, timeout_char=%u, irq=%d",
         self->uart_num, baudrate, self->bits, _parity_name[self->parity],
         self->stop, self->tx, self->rx, self->rts, self->cts, self->txbuf, self->rxbuf, self->timeout, self->timeout_char, self->mp_irq_trigger);
-    mp_printf(print, ", rxovf=%u, txcong=%u", self->rx_overrun, self->tx_congested);
+    mp_printf(print, ", rxovf=%u, txcong=%u, txmax=%u",
+        self->rx_overrun, self->tx_congested, self->tx_max_write);
     if (self->uart_event_task != NULL) {
         mp_printf(print, ", taskstack=%u",
             (unsigned)uxTaskGetStackHighWaterMark(self->uart_event_task));
@@ -529,6 +531,7 @@ static mp_obj_t mp_machine_uart_make_new(const mp_obj_type_t *type, size_t n_arg
         self->c_sink_running = false;
         self->rx_overrun = 0;
         self->tx_congested = 0;
+        self->tx_max_write = 0;
         // remaining fields are set from inside mp_machine_uart_init_helper()
     }
 
@@ -775,6 +778,9 @@ static mp_uint_t mp_machine_uart_write(mp_obj_t self_in, const void *buf_in, mp_
 // congestion, which the caller is expected to handle (TCP retransmits).
 static size_t machine_uart_c_write(void *ctx, const uint8_t *buf, size_t len) {
     machine_uart_obj_t *self = ctx;
+    if (len > self->tx_max_write) {
+        self->tx_max_write = len;
+    }
     size_t free_size = 0;
     if (uart_get_tx_buffer_free_size(self->uart_num, &free_size) != ESP_OK) {
         return 0;
@@ -841,6 +847,9 @@ static mp_uint_t mp_machine_uart_ioctl(mp_obj_t self_in, mp_uint_t request, uint
         mp_stream_c_writer_t *w = (mp_stream_c_writer_t *)arg;
         w->write = machine_uart_c_write;
         w->ctx = self;
+        // The ring is the whole of it: machine_uart_c_write() refuses anything
+        // that does not fit in the free space, and an idle ring is all free.
+        w->max_write = self->txbuf;
         ret = 0;
     } else {
         *errcode = MP_EINVAL;

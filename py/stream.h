@@ -77,6 +77,12 @@ typedef size_t (*mp_stream_c_write_t)(void *ctx, const uint8_t *buf, size_t len)
 typedef struct _mp_stream_c_writer_t {
     mp_stream_c_write_t write;
     void *ctx;
+    // Largest single write the stream can accept when idle. A caller whose
+    // unit of transmission is bigger than this must not use the writer: every
+    // such write would be refused, and for a protocol that cannot split a
+    // frame that means silently dropping all of them. Report the real capacity
+    // so the caller can decide rather than discover it at runtime.
+    size_t max_write;
 } mp_stream_c_writer_t;
 
 // These poll ioctl values are compatible with Linux
