@@ -716,6 +716,6 @@ MP_DEFINE_CONST_OBJ_TYPE(
     locals_dict, &network_ppp_locals_dict
     );
 
-#endif
-
 MP_REGISTER_ROOT_POINTER(struct _network_ppp_obj_t *network_ppp_obj_head);
+
+#endif

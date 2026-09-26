@@ -36,6 +36,7 @@
 #if MICROPY_PY_NETWORK_PPP_LWIP
 
 #include "lwip/dns.h"
+#include "lwip/netif.h"
 #include "netif/ppp/ppp.h"
 #include "netif/ppp/pppapi.h"
 #include "netif/ppp/pppos.h"
@@ -58,9 +59,43 @@ typedef struct _network_ppp_obj_t {
     mp_obj_t stream;
     ppp_pcb *pcb;
     struct netif netif;
+    // Live sessions are kept on a list so that shutdown can find them; see
+    // network_ppp_deinit_all(). lwIP's global netif_list holds a pointer to the
+    // `netif` member above and its callbacks hold `self`, neither of which the
+    // GC can see, so the object's lifetime has to be managed explicitly rather
+    // than left to reachability. In ordinary operation the object happens to be
+    // reachable via the stream's IRQ handler, but that protection is gone once
+    // the IRQ is detached, and irrelevant at soft reset, where gc_sweep_all()
+    // frees everything regardless. Making the list a GC root closes both cases.
+    struct _network_ppp_obj_t *next;
+    bool listed;
 } network_ppp_obj_t;
 
 const mp_obj_type_t mp_network_ppp_lwip_type;
+
+static void network_ppp_list_add(network_ppp_obj_t *self) {
+    if (self->listed) {
+        return;
+    }
+    self->next = MP_STATE_PORT(network_ppp_obj_head);
+    MP_STATE_PORT(network_ppp_obj_head) = self;
+    self->listed = true;
+}
+
+// Drop finished sessions from the root list so they can be collected again.
+static void network_ppp_reap(void) {
+    network_ppp_obj_t **link = &MP_STATE_PORT(network_ppp_obj_head);
+    while (*link != NULL) {
+        network_ppp_obj_t *self = *link;
+        if (self->pcb == NULL) {
+            *link = self->next;
+            self->next = NULL;
+            self->listed = false;
+        } else {
+            link = &self->next;
+        }
+    }
+}
 
 static void network_ppp_stream_uart_irq_disable(network_ppp_obj_t *self) {
     if (self->stream == mp_const_none) {
@@ -109,10 +144,14 @@ static mp_obj_t network_ppp_make_new(const mp_obj_type_t *type, size_t n_args, s
         mp_get_stream_raise(stream, MP_STREAM_OP_READ | MP_STREAM_OP_WRITE);
     }
 
+    network_ppp_reap();
+
     network_ppp_obj_t *self = mp_obj_malloc_with_finaliser(network_ppp_obj_t, type);
     self->state = STATE_INACTIVE;
     self->stream = stream;
     self->pcb = NULL;
+    self->next = NULL;
+    self->listed = false;
 
     return MP_OBJ_FROM_PTR(self);
 }
@@ -278,6 +317,8 @@ static mp_obj_t network_ppp_connect(size_t n_args, const mp_obj_t *args, mp_map_
         if (self->pcb == NULL) {
             mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("pppos_create failed"));
         }
+        // From here on lwIP holds a pointer to self->netif: keep the object alive.
+        network_ppp_list_add(self);
         self->state = STATE_ACTIVE;
 
         network_ppp_stream_uart_irq_enable(self);
@@ -347,6 +388,52 @@ static mp_obj_t network_ppp_ipconfig(size_t n_args, const mp_obj_t *args, mp_map
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(network_ppp_ipconfig_obj, 1, network_ppp_ipconfig);
 
+// Tear one session down far enough that lwIP no longer references memory owned
+// by the MicroPython heap. Must not raise: it runs from the soft-reset path,
+// outside any nlr handler.
+static void network_ppp_force_close(network_ppp_obj_t *self) {
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        network_ppp_stream_uart_irq_disable(self);
+        nlr_pop();
+    }
+    // Stop the output callback from calling back into a VM that is being torn down.
+    self->stream = mp_const_none;
+
+    if (self->pcb != NULL && self->state >= STATE_ERROR) {
+        // nocarrier=1: do not wait for the peer, we are shutting down. Unlike
+        // the esp32 version of this file there is nothing to wait *for* here --
+        // lwIP runs in this context (NO_SYS), so ppp_close() takes the session
+        // through the status callback, ppp_free() and netif_remove() before it
+        // returns, at least from the running phase.
+        ppp_close(self->pcb, 1);
+    }
+    if (self->pcb != NULL && ppp_free(self->pcb) == ERR_OK) {
+        self->pcb = NULL;
+    }
+    if (self->pcb != NULL) {
+        // The session would not go down (ppp_free returns ERR_CONN unless the
+        // pcb is dead). Leaking the pcb is survivable; leaving a netif that
+        // points into about-to-be-recycled heap in lwIP's global list is not.
+        netif_remove(&self->netif);
+    }
+    self->state = STATE_INACTIVE;
+}
+
+// Called from the port's soft-reset path, BEFORE the UART deinit: detaching the
+// stream IRQ needs the stream object to still be usable.
+void network_ppp_deinit_all(void) {
+    network_ppp_obj_t *self = MP_STATE_PORT(network_ppp_obj_head);
+    MP_STATE_PORT(network_ppp_obj_head) = NULL;
+    while (self != NULL) {
+        network_ppp_obj_t *next = self->next;
+        self->next = NULL;
+        self->listed = false;
+        network_ppp_force_close(self);
+        self = next;
+    }
+}
+
 static const mp_rom_map_elem_t network_ppp_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&network_ppp___del___obj) },
     { MP_ROM_QSTR(MP_QSTR_config), MP_ROM_PTR(&network_ppp_config_obj) },
@@ -371,5 +458,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
     make_new, network_ppp_make_new,
     locals_dict, &network_ppp_locals_dict
     );
+
+MP_REGISTER_ROOT_POINTER(struct _network_ppp_obj_t *network_ppp_obj_head);
 
 #endif
