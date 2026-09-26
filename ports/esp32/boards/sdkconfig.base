@@ -157,3 +157,9 @@ CONFIG_LWIP_MAX_ACTIVE_TCP=12
 # Enable new I2C slave API, and disable conflict check.
 CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
 CONFIG_I2C_ENABLE_SLAVE_DRIVER_VERSION_2=y
+
+# Raise the FreeRTOS tick from the 100 Hz default. Every wait that goes through
+# mp_event_wait_ms() -- which is what asyncio uses between tasks -- is rounded up
+# to a whole tick, so at 100 Hz asyncio.sleep_ms(1) actually takes ~7 ms and
+# sleep_ms(50) takes ~59 ms. At 1000 Hz that systematic overshoot drops to ~1 ms.
+CONFIG_FREERTOS_HZ=1000
