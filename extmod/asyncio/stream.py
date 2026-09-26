@@ -100,7 +100,7 @@ def open_connection(host, port, ssl=None, server_hostname=None):
     from errno import EINPROGRESS
     import socket
 
-    ai = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)[0]  # TODO this is blocking!
+    ai = (yield from core.Loop.getaddrinfo(host, port, type=socket.SOCK_STREAM))[0]
     s = socket.socket(ai[0], ai[1], ai[2])
     s.setblocking(False)
     try:
@@ -180,7 +180,7 @@ async def start_server(cb, host, port, backlog=5, ssl=None):
     import socket
 
     # Create and bind server socket.
-    addr_info = socket.getaddrinfo(host, port)[0]  # TODO this is blocking!
+    addr_info = (await core.Loop.getaddrinfo(host, port))[0]
     s = socket.socket(addr_info[0])  # Use address family from getaddrinfo
     s.setblocking(False)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

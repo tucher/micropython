@@ -285,6 +285,13 @@ class Loop:
     def close():
         pass
 
+    # CPython compatibility: asyncio's own resolver entry point, with the same
+    # signature and the same return value as socket.getaddrinfo -- but awaitable,
+    # so a lookup does not stop the event loop. socket.getaddrinfo itself stays
+    # blocking, exactly as it is in CPython.
+    def getaddrinfo(host, port, *, family=0, type=0, proto=0, flags=0):
+        return _getaddrinfo(host, port, family, type, proto, flags)
+
     def set_exception_handler(handler):
         Loop._exc_handler = handler
 
@@ -298,6 +305,49 @@ class Loop:
 
     def call_exception_handler(context):
         (Loop._exc_handler or Loop.default_exception_handler)(Loop, context)
+
+
+################################################################################
+# Name resolution
+
+
+# Resolved once, on first use. Not a micro-optimisation: `import` of an
+# extensible built-in searches the filesystem before falling back to the
+# built-in, and never caches the result in sys.modules -- on esp32 that is
+# ~26 ms of littlefs lookups per call, on the connection path.
+_getaddrinfo_start = None
+_getaddrinfo_blocking = None
+
+
+# async
+def _getaddrinfo(host, port, family, type, proto, flags):
+    # CPython runs socket.getaddrinfo in a thread pool here. There is no pool on
+    # a microcontroller; instead a port may offer socket._getaddrinfo_start(),
+    # which starts the query and hands back an object that becomes readable when
+    # the answer arrives -- so the lookup waits in the same poll() as every
+    # socket, and the loop keeps running. Ports without it keep the old
+    # behaviour: the blocking call, which does stall the loop.
+    #
+    # CPython also short-circuits hosts that are already address literals
+    # (_ipaddr_info in asyncio.base_events). That cannot be done here: CPython's
+    # sockaddr is a (host, port) tuple, while a MicroPython port is free to use
+    # its own representation -- the unix port hands back a packed bytearray --
+    # so only the port itself can build a result without asking the resolver.
+    # _getaddrinfo_start() does exactly that, and reports done immediately.
+    global _getaddrinfo_start, _getaddrinfo_blocking
+
+    if _getaddrinfo_blocking is None:
+        import socket
+
+        _getaddrinfo_start = getattr(socket, "_getaddrinfo_start", None)
+        _getaddrinfo_blocking = socket.getaddrinfo
+
+    if _getaddrinfo_start is None or not isinstance(host, str):
+        return _getaddrinfo_blocking(host, port, family, type, proto, flags)
+
+    req = _getaddrinfo_start(host, port, family, type, proto, flags)
+    yield _io_queue.queue_read(req)
+    return req.result()
 
 
 # The runq_len and waitq_len arguments are for legacy uasyncio compatibility
