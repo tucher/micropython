@@ -166,3 +166,22 @@ CONFIG_I2C_ENABLE_SLAVE_DRIVER_VERSION_2=y
 # to a whole tick, so at 100 Hz asyncio.sleep_ms(1) actually takes ~7 ms and
 # sleep_ms(50) takes ~59 ms. At 1000 Hz that systematic overshoot drops to ~1 ms.
 CONFIG_FREERTOS_HZ=1000
+
+# TCP window. The default of 5760 (4 x MSS) caps a single stream at
+# window / RTT: at the 167 ms RTT measured over this link that is 34 kB/s,
+# which is under the 92 kB/s the wire allows at 921600 baud. 16 x MSS covers
+# the bandwidth-delay product with room to spare. The receive mailbox has to
+# hold the window in MSS-sized pbufs, so it grows with it.
+CONFIG_LWIP_TCP_WND_DEFAULT=23040
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=23040
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+
+# A window is only as good as the receiver's ability to hold what arrives
+# after a gap. The default out-of-sequence queue is 4 pbufs, so with a
+# 16-segment window one lost segment would strand the twelve behind it and
+# force them to be sent again. Size it to the window. SACK lets the sender
+# retransmit only the hole instead of guessing, which matters on a cellular
+# link where the odd loss is normal.
+# 12 is the Kconfig maximum for this option; a larger value is ignored.
+CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=12
+CONFIG_LWIP_TCP_SACK_OUT=y
