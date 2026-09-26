@@ -108,7 +108,7 @@
 
 // The "select" module is enabled by default, but disable select.select().
 #define MICROPY_PY_SELECT_POSIX_OPTIMISATIONS (1)
-#define MICROPY_PY_SELECT_SELECT       (0)
+#define MICROPY_PY_SELECT_SELECT       (1)
 
 // Enable the "websocket" module.
 #define MICROPY_PY_WEBSOCKET           (1)

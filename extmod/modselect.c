@@ -35,10 +35,6 @@
 
 #if MICROPY_PY_SELECT
 
-#if MICROPY_PY_SELECT_SELECT && MICROPY_PY_SELECT_POSIX_OPTIMISATIONS
-#error "select.select is not supported with MICROPY_PY_SELECT_POSIX_OPTIMISATIONS"
-#endif
-
 #if MICROPY_PY_SELECT_POSIX_OPTIMISATIONS
 
 #include <string.h>
@@ -115,8 +111,17 @@ static void poll_set_deinit(poll_set_t *poll_set) {
 #if MICROPY_PY_SELECT_POSIX_OPTIMISATIONS
 
 static mp_uint_t poll_obj_get_events(poll_obj_t *poll_obj) {
-    assert(poll_obj->pollfd == NULL);
-    return poll_obj->nonfd_events;
+    // Mirrors poll_obj_get_revents(): for an object with a file descriptor the
+    // events live in its pollfd entry. This used to assert pollfd == NULL,
+    // which held only while poll_set_poll_once() was the sole caller. select()
+    // also reads it, to merge the events of an object that appears in more than
+    // one of the read/write/error lists -- and with the assert compiled out it
+    // silently returned 0 there, dropping every event set by an earlier list.
+    if (poll_obj->pollfd != NULL) {
+        return poll_obj->pollfd->events;
+    } else {
+        return poll_obj->nonfd_events;
+    }
 }
 
 static void poll_obj_set_events(poll_obj_t *poll_obj, mp_uint_t events) {
@@ -338,6 +343,41 @@ static mp_uint_t poll_set_poll_once(poll_set_t *poll_set, size_t *rwx_num) {
     return n_ready;
 }
 
+#if MICROPY_PY_SELECT_POSIX_OPTIMISATIONS && MICROPY_PY_SELECT_SELECT
+// Objects with a file descriptor are polled by poll() and skipped by
+// poll_set_poll_once(), so their readiness never reached the per-category
+// totals that select() reports. Count them here, from the revents that poll()
+// just filled in. The POLL constants are asserted to match MP_STREAM_POLL_*
+// above, so they can be tested directly.
+static void poll_set_count_fd_revents(poll_set_t *poll_set, size_t *rwx_num) {
+    if (rwx_num == NULL) {
+        return;
+    }
+    for (mp_uint_t i = 0; i < poll_set->map.alloc; ++i) {
+        if (!mp_map_slot_is_filled(&poll_set->map, i)) {
+            continue;
+        }
+        poll_obj_t *poll_obj = MP_OBJ_TO_PTR(poll_set->map.table[i].value);
+        if (poll_obj->pollfd == NULL) {
+            continue;
+        }
+        mp_uint_t revents = poll_obj->pollfd->revents;
+        if (revents == 0) {
+            continue;
+        }
+        if (revents & MP_STREAM_POLL_RD) {
+            rwx_num[0] += 1;
+        }
+        if (revents & MP_STREAM_POLL_WR) {
+            rwx_num[1] += 1;
+        }
+        if ((revents & ~(MP_STREAM_POLL_RD | MP_STREAM_POLL_WR)) != 0) {
+            rwx_num[2] += 1;
+        }
+    }
+}
+#endif
+
 static mp_uint_t poll_set_poll_until_ready_or_timeout(poll_set_t *poll_set, size_t *rwx_num, mp_uint_t timeout) {
     mp_uint_t start_ticks = mp_hal_ticks_ms();
     bool has_timeout = timeout != (mp_uint_t)-1;
@@ -380,6 +420,13 @@ static mp_uint_t poll_set_poll_until_ready_or_timeout(poll_set_t *poll_set, size
             }
             n_ready = 0;
         }
+
+        #if MICROPY_PY_SELECT_SELECT
+        // Fold the fds that poll() reported into select()'s category totals.
+        // Safe to run every iteration: when poll() found nothing ready all the
+        // revents are zero and this adds nothing.
+        poll_set_count_fd_revents(poll_set, rwx_num);
+        #endif
 
         // Explicitly poll any objects that do not have a file descriptor.
         if (!poll_set_all_are_fds(poll_set)) {
@@ -461,13 +508,17 @@ static mp_obj_t select_select(size_t n_args, const mp_obj_t *args) {
             continue;
         }
         poll_obj_t *poll_obj = MP_OBJ_TO_PTR(poll_set.map.table[i].value);
-        if (poll_obj->revents & MP_STREAM_POLL_RD) {
+        // Via the accessor: with POSIX optimisations the revents of an object
+        // that has a file descriptor live in its pollfd entry, not in the
+        // poll_obj itself.
+        mp_uint_t revents = poll_obj_get_revents(poll_obj);
+        if (revents & MP_STREAM_POLL_RD) {
             ((mp_obj_list_t *)MP_OBJ_TO_PTR(list_array[0]))->items[rwx_len[0]++] = poll_obj->obj;
         }
-        if (poll_obj->revents & MP_STREAM_POLL_WR) {
+        if (revents & MP_STREAM_POLL_WR) {
             ((mp_obj_list_t *)MP_OBJ_TO_PTR(list_array[1]))->items[rwx_len[1]++] = poll_obj->obj;
         }
-        if ((poll_obj->revents & ~(MP_STREAM_POLL_RD | MP_STREAM_POLL_WR)) != 0) {
+        if ((revents & ~(MP_STREAM_POLL_RD | MP_STREAM_POLL_WR)) != 0) {
             ((mp_obj_list_t *)MP_OBJ_TO_PTR(list_array[2]))->items[rwx_len[2]++] = poll_obj->obj;
         }
     }
