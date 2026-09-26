@@ -140,7 +140,7 @@ void socket_events_handler(void) {
 
     // Poll the sockets
     struct timeval timeout = { .tv_sec = 0, .tv_usec = 0 };
-    int r = select(max_fd + 1, &rfds, NULL, NULL, &timeout);
+    int r = lwip_select(max_fd + 1, &rfds, NULL, NULL, &timeout);
     if (r <= 0) {
         return;
     }
@@ -454,7 +454,10 @@ static mp_obj_t socket_connect(const mp_obj_t arg0, const mp_obj_t arg1) {
             FD_ZERO(&wfds);
             FD_SET(self->fd, &wfds);
 
-            int r = select(self->fd + 1, NULL, &wfds, NULL, &timeout);
+            // lwip_select() for the same reason as in socket_stream_ioctl():
+            // select() here is esp_vfs_select(), which walks every fd slot up
+            // to this socket's number.
+            int r = lwip_select(self->fd + 1, NULL, &wfds, NULL, &timeout);
             if (r < 0) {
                 // Error condition
                 raise_err = errno;
@@ -636,13 +639,16 @@ static mp_uint_t _socket_read_data(mp_obj_t self_in, void *buf, size_t size, mp_
     for (int i = 0; i <= sock->retries; ++i) {
         // Poll the socket to see if it has waiting data and only release the GIL if it doesn't.
         // This ensures higher performance in the case of many small reads, eg for readline.
+        // lwip_select() rather than select(): this probe runs before *every*
+        // recv, and as esp_vfs_select() it costs more than the GIL release it
+        // is trying to avoid.
         bool release_gil;
         {
             fd_set rfds;
             FD_ZERO(&rfds);
             FD_SET(sock->fd, &rfds);
             struct timeval timeout = { .tv_sec = 0, .tv_usec = 0 };
-            int r = select(sock->fd + 1, &rfds, NULL, NULL, &timeout);
+            int r = lwip_select(sock->fd + 1, &rfds, NULL, NULL, &timeout);
             release_gil = r != 1;
         }
         if (release_gil) {
@@ -842,7 +848,10 @@ static mp_uint_t socket_stream_ioctl(mp_obj_t self_in, mp_uint_t request, uintpt
             FD_SET(socket->fd, &efds);
         }
 
-        int r = select((socket->fd) + 1, &rfds, &wfds, &efds, &timeout);
+        // lwip_select() rather than select(): with LWIP_COMPAT_SOCKETS == 0 the
+        // latter resolves to esp_vfs_select(), whose cost is proportional to the
+        // fd number, and lwIP places sockets at the top of the fd space.
+        int r = lwip_select((socket->fd) + 1, &rfds, &wfds, &efds, &timeout);
         if (r < 0) {
             *errcode = MP_EIO;
             return MP_STREAM_ERROR;
