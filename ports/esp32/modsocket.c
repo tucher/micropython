@@ -53,14 +53,12 @@
 #include "lwip/netdb.h"
 #include "lwip/ip4.h"
 #include "lwip/igmp.h"
-#include "lwip/dns.h"
-#include "lwip/tcpip.h"
 #include "esp_log.h"
 
 // See note at bottom of file about why this isn't MICROPY_PY_SOCKET
 #if MICROPY_PY_NETWORK
 
-#define SOCKET_POLL_US (20000)
+#define SOCKET_POLL_US (100000)
 #define MDNS_QUERY_TIMEOUT_MS (5000)
 #define MDNS_LOCAL_SUFFIX ".local"
 
@@ -217,40 +215,9 @@ static int mdns_getaddrinfo(const char *host_str, const char *port_str,
 }
 #endif // MICROPY_HW_ENABLE_MDNS_QUERIES
 
-// State for non-blocking DNS resolution
-typedef struct _getaddrinfo_state_t {
-    volatile int status;   // 0=pending, 1=resolved, <0=error
-    ip_addr_t ipaddr;
-    const char *host;
-    u8_t dns_addrtype;
-} getaddrinfo_state_t;
-
-// Called by lwip on tcpip_thread when DNS resolves (or fails)
-static void _dns_found_callback(const char *name, const ip_addr_t *ipaddr, void *arg) {
-    getaddrinfo_state_t *state = (getaddrinfo_state_t *)arg;
-    if (ipaddr != NULL) {
-        state->ipaddr = *ipaddr;
-        state->status = 1;
-    } else {
-        state->status = -2;  // name not found
-    }
-}
-
-// Dispatched to tcpip_thread via tcpip_callback()
-static void _dns_resolve_on_tcpip(void *arg) {
-    getaddrinfo_state_t *state = (getaddrinfo_state_t *)arg;
-    err_t ret = dns_gethostbyname_addrtype(
-        state->host, &state->ipaddr, _dns_found_callback, state, state->dns_addrtype);
-    if (ret == ERR_OK) {
-        state->status = 1;  // cached, resolved immediately
-    } else if (ret != ERR_INPROGRESS) {
-        state->status = ret; // error (ERR_VAL if no DNS server, ERR_ARG, etc.)
-    }
-    // if ERR_INPROGRESS: _dns_found_callback will set status later
-}
-
 static void _getaddrinfo_inner(const mp_obj_t host, const mp_obj_t portx,
     struct addrinfo *hints, struct addrinfo **res) {
+    int retval = 0;
 
     *res = NULL;
 
@@ -269,100 +236,35 @@ static void _getaddrinfo_inner(const mp_obj_t host, const mp_obj_t portx,
         host_str = "0.0.0.0";
     }
 
-    // Try IP literal first (no DNS needed, no deadlock possible)
-    ip_addr_t addr;
-    if (ipaddr_aton(host_str, &addr)) {
-        hints->ai_flags |= AI_CANONNAME;
-        MP_THREAD_GIL_EXIT();
-        int retval = lwip_getaddrinfo(host_str, port_str, hints, res);
-        MP_THREAD_GIL_ENTER();
-        if (retval != 0) {
-            mp_raise_OSError(retval > 0 ? -retval : retval);
-        }
-        return;
-    }
+    MP_THREAD_GIL_EXIT();
+
+    // The ai_canonname field is used below, so set the hint.
+    hints->ai_flags |= AI_CANONNAME;
 
     #if MICROPY_HW_ENABLE_MDNS_QUERIES
-    // Try mDNS (uses its own mechanism, doesn't go through DNS)
-    hints->ai_flags |= AI_CANONNAME;
-    MP_THREAD_GIL_EXIT();
-    int mdns_ret = mdns_getaddrinfo(host_str, port_str, hints, res);
-    MP_THREAD_GIL_ENTER();
-    if (mdns_ret == 0 && *res != NULL) {
-        return;
-    }
+    retval = mdns_getaddrinfo(host_str, port_str, hints, res);
     #endif
 
-    // DNS resolution: dispatch to tcpip_thread, poll for result.
-    // We cannot call lwip_getaddrinfo() directly because it blocks on a semaphore
-    // waiting for the DNS response — but the PPP data pump (network_ppp_poll) runs
-    // as a soft IRQ via mp_sched_schedule and needs check_for_exceptions() to fire.
-    // Instead, we dispatch dns_gethostbyname_addrtype() to the tcpip_thread and poll
-    // with check_for_exceptions() between iterations, same pattern as connect/recv/send.
-    getaddrinfo_state_t state;
-    state.status = 0;
-    state.host = host_str;
-    state.dns_addrtype = LWIP_DNS_ADDRTYPE_DEFAULT;
-
-    #if LWIP_IPV4 && LWIP_IPV6
-    if (hints->ai_family == AF_INET) {
-        state.dns_addrtype = LWIP_DNS_ADDRTYPE_IPV4;
-    } else if (hints->ai_family == AF_INET6) {
-        state.dns_addrtype = LWIP_DNS_ADDRTYPE_IPV6;
-    }
-    #endif
-
-    err_t err = tcpip_callback(_dns_resolve_on_tcpip, &state);
-    if (err != ERR_OK) {
-        mp_raise_OSError(-EAI_FAIL);
+    if (retval == 0 && *res == NULL) {
+        // Normal query
+        retval = lwip_getaddrinfo(host_str, port_str, hints, res);
     }
 
-    // Poll until resolved, with check_for_exceptions() to pump PPP data.
-    // Use mp_hal_delay_us (busy-wait with mp_handle_pending) with GIL held,
-    // same as how it works internally — it calls mp_handle_pending() which
-    // runs scheduled callbacks like network_ppp_poll().
-    // Timeout: ~20 seconds (1000 * 20ms)
-    for (int i = 0; i < 1000 && state.status == 0; i++) {
-        mp_hal_delay_us(SOCKET_POLL_US);
-        check_for_exceptions();
-    }
-
-    if (state.status == 0) {
-        mp_raise_OSError(-EAI_FAIL);  // timeout
-    }
-    if (state.status < 0) {
-        mp_raise_OSError(state.status);
-    }
-
-    // Build addrinfo result from resolved IP.
-    // Use lwip_getaddrinfo with the resolved IP string — resolves immediately
-    // (IP literal, no DNS) and correctly builds the addrinfo struct.
-    char ip_str[IPADDR_STRLEN_MAX];
-    ipaddr_ntoa_r(&state.ipaddr, ip_str, sizeof(ip_str));
-    hints->ai_flags |= AI_CANONNAME;
-    MP_THREAD_GIL_EXIT();
-    int retval = lwip_getaddrinfo(ip_str, port_str, hints, res);
     MP_THREAD_GIL_ENTER();
+
+    // Per docs: instead of raising gaierror getaddrinfo raises negative error number
     if (retval != 0) {
         mp_raise_OSError(retval > 0 ? -retval : retval);
     }
-
     // Somehow LwIP returns a resolution of 0.0.0.0 for failed lookups, traced it as far back
     // as netconn_gethostbyname_addrtype returning OK instead of error.
     if (*res == NULL ||
-        (strcmp(res[0]->ai_canonname, "0.0.0.0") == 0 && strcmp(ip_str, "0.0.0.0") != 0)) {
+        (strcmp(res[0]->ai_canonname, "0.0.0.0") == 0 && strcmp(host_str, "0.0.0.0") != 0)) {
         lwip_freeaddrinfo(*res);
         mp_raise_OSError(-2); // name or service not known
     }
 
-    // Replace canonname with original hostname (not the IP)
-    // lwip_getaddrinfo sets ai_canonname to the IP string; we want the hostname
-    if (*res != NULL && (*res)->ai_canonname != NULL) {
-        size_t host_len = strlen(host_str);
-        if (host_len < IPADDR_STRLEN_MAX) {
-            memcpy((*res)->ai_canonname, host_str, host_len + 1);
-        }
-    }
+    assert(retval == 0 && *res != NULL);
 }
 
 static void _socket_getaddrinfo(const mp_obj_t addrtuple, struct addrinfo **resp) {
@@ -941,11 +843,8 @@ static mp_uint_t socket_stream_ioctl(mp_obj_t self_in, mp_uint_t request, uintpt
         }
 
         // lwip_select() rather than select(): with LWIP_COMPAT_SOCKETS == 0 the
-        // latter resolves to esp_vfs_select(), which allocates twice, takes the
-        // global fd-table lock and walks every registered VFS driver before it
-        // reaches lwIP -- measured at ~2.1 ms for this single-fd call, paid on
-        // every poll of every socket. The fd is the same number either way:
-        // LWIP_SOCKET_OFFSET is applied inside lwIP.
+        // latter resolves to esp_vfs_select(), whose cost is proportional to the
+        // fd number, and lwIP places sockets at the top of the fd space.
         int r = lwip_select((socket->fd) + 1, &rfds, &wfds, &efds, &timeout);
         if (r < 0) {
             *errcode = MP_EIO;
