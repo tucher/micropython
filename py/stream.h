@@ -47,6 +47,7 @@
 #define MP_STREAM_GET_BUFFER_SIZE   (11) // Get preferred buffer size for file
 #if MICROPY_STREAMS_DELEGATE_ERROR
 #define MP_STREAM_RAISE_ERROR       (12) // Raise an error with detailed error string
+#endif
 #define MP_STREAM_SET_DATA_SINK     (13) // Push incoming data to a C callback
 
 // Argument to MP_STREAM_SET_DATA_SINK. A stream that implements this request
@@ -77,7 +78,6 @@ typedef struct _mp_stream_c_writer_t {
     mp_stream_c_write_t write;
     void *ctx;
 } mp_stream_c_writer_t;
-#endif
 
 // These poll ioctl values are compatible with Linux
 #define MP_STREAM_POLL_RD       (0x0001)
