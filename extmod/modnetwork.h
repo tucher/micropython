@@ -79,6 +79,9 @@ mp_obj_t mod_network_hostname(size_t n_args, const mp_obj_t *args);
 
 #if MICROPY_PY_NETWORK_PPP_LWIP
 extern const struct _mp_obj_type_t mp_network_ppp_lwip_type;
+// Close every live PPP session so that lwIP stops referencing the MicroPython
+// heap. Called from mod_network_deinit(), i.e. from each port's soft reset.
+void network_ppp_deinit_all(void);
 #endif
 
 struct netif;

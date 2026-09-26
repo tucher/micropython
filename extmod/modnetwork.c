@@ -88,6 +88,14 @@ void mod_network_init(void) {
 }
 
 void mod_network_deinit(void) {
+    #if MICROPY_PY_NETWORK_PPP_LWIP
+    // A PPP netif lives inside a GC-heap object, and lwIP's global netif_list
+    // points at it. A soft reset recycles that heap without telling lwIP, which
+    // then walks a dangling pointer from its timer thread. Every port that
+    // calls us does so before deinitialising its UARTs, which is what the
+    // teardown needs to detach the stream IRQ.
+    network_ppp_deinit_all();
+    #endif
     #if !MICROPY_PY_LWIP
     for (mp_uint_t i = 0; i < MP_STATE_PORT(mod_network_nic_list).len; i++) {
         mp_obj_t nic = MP_STATE_PORT(mod_network_nic_list).items[i];
