@@ -109,6 +109,15 @@ uint32_t mp_hal_get_cpu_freq(void);
 void mp_hal_wake_main_task(void);
 void mp_hal_wake_main_task_from_isr(void);
 
+// A descriptor that can be carried in a select() set and signalled from
+// anywhere, interrupt handlers included, so that a wait over sockets can be
+// broken by something other than a socket. See docs/ppp_plan_max.md, W3b.
+// Returns -1 if the descriptor could not be created.
+void mp_hal_wake_fd_init(void);
+int mp_hal_wake_fd(void);
+void mp_hal_wake_fd_signal(void);
+void mp_hal_wake_fd_drain(void);
+
 // C-level pin HAL
 #include "py/obj.h"
 #include "driver/gpio.h"

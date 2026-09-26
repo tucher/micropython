@@ -30,6 +30,9 @@
 #include <string.h>
 #include <sys/time.h>
 
+#include <unistd.h>
+#include "esp_vfs_eventfd.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
@@ -256,6 +259,44 @@ uint64_t mp_hal_time_ns(void) {
 }
 
 // Wake up the main task if it is sleeping.
+// The wake descriptor. ESP-IDF's eventfd with EFD_SUPPORT_ISR is the
+// documented mechanism for signalling a select() from an interrupt handler;
+// an lwIP socket cannot be used for this because lwip_sendto() is not
+// callable from an ISR.
+static int wake_fd = -1;
+
+void mp_hal_wake_fd_init(void) {
+    if (wake_fd >= 0) {
+        return;
+    }
+    esp_vfs_eventfd_config_t config = ESP_VFS_EVENTD_CONFIG_DEFAULT();
+    config.max_fds = 1;
+    if (esp_vfs_eventfd_register(&config) != ESP_OK) {
+        return;
+    }
+    wake_fd = eventfd(0, EFD_SUPPORT_ISR);
+}
+
+int mp_hal_wake_fd(void) {
+    return wake_fd;
+}
+
+void mp_hal_wake_fd_signal(void) {
+    if (wake_fd >= 0) {
+        uint64_t one = 1;
+        write(wake_fd, &one, sizeof(one));
+    }
+}
+
+// Only call once select() has reported the descriptor readable: an eventfd
+// read blocks while the counter is zero.
+void mp_hal_wake_fd_drain(void) {
+    if (wake_fd >= 0) {
+        uint64_t discard;
+        read(wake_fd, &discard, sizeof(discard));
+    }
+}
+
 void mp_hal_wake_main_task(void) {
     xTaskNotifyGive(mp_main_task_handle);
 }

@@ -1241,6 +1241,71 @@ static MP_DEFINE_CONST_OBJ_TYPE(
     locals_dict, &getaddrinfo_req_locals_dict
     );
 
+// TEMPORARY, for the W3b decision: what does a wait cost when the set has to
+// carry the wake descriptor as well as sockets? A mixed set cannot go to
+// lwip_select() and lands in esp_vfs_select(), whose cost grows with the
+// highest fd number -- and lwIP puts sockets at the top of the fd space.
+// Remove once W3b has picked its design.
+static mp_obj_t esp_socket_select_cost(mp_obj_t n_in) {
+    int n = mp_obj_get_int(n_in);
+    if (n < 0 || n > 8) {
+        mp_raise_ValueError(NULL);
+    }
+    int fds[8];
+    int maxfd = 0;
+    for (int i = 0; i < n; i++) {
+        fds[i] = lwip_socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in a = { 0 };
+        a.sin_family = AF_INET;
+        a.sin_port = lwip_htons(12300 + i);
+        lwip_bind(fds[i], (struct sockaddr *)&a, sizeof(a));
+        if (fds[i] > maxfd) {
+            maxfd = fds[i];
+        }
+    }
+    int wake = mp_hal_wake_fd();
+
+    const int reps = 100;
+    struct timeval tv = { 0, 0 };
+    fd_set rfds;
+
+    // 1. socket-only set through lwip_select()
+    int64_t t0 = esp_timer_get_time();
+    for (int r = 0; r < reps; r++) {
+        FD_ZERO(&rfds);
+        for (int i = 0; i < n; i++) {
+            FD_SET(fds[i], &rfds);
+        }
+        lwip_select(maxfd + 1, &rfds, NULL, NULL, &tv);
+    }
+    int64_t lwip_us = (esp_timer_get_time() - t0) / reps;
+
+    // 2. same set plus the wake descriptor, through the VFS select()
+    int mixed_max = maxfd > wake ? maxfd : wake;
+    t0 = esp_timer_get_time();
+    for (int r = 0; r < reps; r++) {
+        FD_ZERO(&rfds);
+        for (int i = 0; i < n; i++) {
+            FD_SET(fds[i], &rfds);
+        }
+        if (wake >= 0) {
+            FD_SET(wake, &rfds);
+        }
+        select(mixed_max + 1, &rfds, NULL, NULL, &tv);
+    }
+    int64_t mixed_us = (esp_timer_get_time() - t0) / reps;
+
+    for (int i = 0; i < n; i++) {
+        lwip_close(fds[i]);
+    }
+    mp_obj_t res[4] = {
+        mp_obj_new_int(lwip_us), mp_obj_new_int(mixed_us),
+        mp_obj_new_int(maxfd), mp_obj_new_int(wake),
+    };
+    return mp_obj_new_tuple(4, res);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(esp_socket_select_cost_obj, esp_socket_select_cost);
+
 static mp_obj_t esp_socket_initialize() {
     static int initialized = 0;
     if (!initialized) {
@@ -1259,6 +1324,7 @@ static const mp_rom_map_elem_t mp_module_socket_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_getaddrinfo), MP_ROM_PTR(&esp_socket_getaddrinfo_obj) },
     // Private: the non-blocking half, used by asyncio's Loop.getaddrinfo().
     { MP_ROM_QSTR(MP_QSTR__getaddrinfo_start), MP_ROM_PTR(&esp_socket_getaddrinfo_start_obj) },
+    { MP_ROM_QSTR(MP_QSTR__select_cost), MP_ROM_PTR(&esp_socket_select_cost_obj) },
 
     { MP_ROM_QSTR(MP_QSTR_AF_INET), MP_ROM_INT(AF_INET) },
     { MP_ROM_QSTR(MP_QSTR_AF_INET6), MP_ROM_INT(AF_INET6) },
