@@ -307,7 +307,7 @@ static mp_obj_t network_wlan_active(size_t n_args, const mp_obj_t *args) {
 
         // Wait for the interface to be in the correct state.
         while (self->active != active) {
-            MICROPY_EVENT_POLL_HOOK;
+            mp_event_wait_ms(1);
         }
     }
 

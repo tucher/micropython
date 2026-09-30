@@ -346,28 +346,12 @@ void *esp_native_code_commit(void *, size_t, void *);
 #define MICROPY_PY_SOCKET_EVENTS_HANDLER
 #endif
 
-#if MICROPY_PY_THREAD
-#define MICROPY_EVENT_POLL_HOOK \
-    do { \
-        mp_handle_pending(MP_HANDLE_PENDING_CALLBACKS_AND_EXCEPTIONS); \
-        MICROPY_PY_SOCKET_EVENTS_HANDLER \
-        MP_THREAD_GIL_EXIT(); \
-        ulTaskNotifyTake(pdFALSE, 1); \
-        MP_THREAD_GIL_ENTER(); \
-    } while (0);
-#else
-#if CONFIG_IDF_TARGET_ARCH_RISCV
-#define MICROPY_PY_WAIT_FOR_INTERRUPT asm volatile ("wfi\n")
-#else
-#define MICROPY_PY_WAIT_FOR_INTERRUPT asm volatile ("waiti 0\n")
-#endif
-#define MICROPY_EVENT_POLL_HOOK \
-    do { \
-        mp_handle_pending(MP_HANDLE_PENDING_CALLBACKS_AND_EXCEPTIONS); \
-        MICROPY_PY_SOCKET_EVENTS_HANDLER \
-            MICROPY_PY_WAIT_FOR_INTERRUPT; \
-    } while (0);
-#endif
+// Port-specific non-blocking event processing, run by mp_event_handle_nowait()
+// before every wait. This is where the legacy MICROPY_EVENT_POLL_HOOK used to
+// call it from; the hook itself is gone, so that mp_event_wait_ms() can honour
+// the timeout it is given instead of always sleeping one tick. The waiting
+// half is MICROPY_INTERNAL_WFE in mphalport.h.
+#define MICROPY_INTERNAL_EVENT_HOOK MICROPY_PY_SOCKET_EVENTS_HANDLER
 
 // Functions that should go in IRAM
 // For ESP32 with SPIRAM workaround, firmware is larger and uses more static IRAM,

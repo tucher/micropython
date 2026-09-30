@@ -30,9 +30,6 @@
 #include <string.h>
 #include <sys/time.h>
 
-#include <unistd.h>
-#include "esp_vfs_eventfd.h"
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
@@ -42,6 +39,7 @@
 #include "py/stream.h"
 #include "py/mpstate.h"
 #include "py/mphal.h"
+#include "py/runtime.h"
 #include "extmod/misc.h"
 #include "shared/timeutils/timeutils.h"
 #include "shared/runtime/pyexec.h"
@@ -147,7 +145,7 @@ int mp_hal_stdin_rx_chr(void) {
             return dupterm_c;
         }
         #endif
-        MICROPY_EVENT_POLL_HOOK
+        mp_event_wait_ms(1);
     }
 }
 
@@ -202,22 +200,22 @@ void mp_hal_delay_ms(mp_uint_t ms) {
     uint64_t dt;
     uint64_t t0 = esp_timer_get_time();
     for (;;) {
-        mp_handle_pending(MP_HANDLE_PENDING_CALLBACKS_AND_EXCEPTIONS);
-        MICROPY_PY_SOCKET_EVENTS_HANDLER
-        MP_THREAD_GIL_EXIT();
-        uint64_t t1 = esp_timer_get_time();
-        dt = t1 - t0;
+        dt = esp_timer_get_time() - t0;
         if (dt + portTICK_PERIOD_MS * 1000ULL >= us) {
-            // doing a vTaskDelay would take us beyond requested delay time
+            // Doing a vTaskDelay would take us beyond the requested time, so
+            // yield once and spin out the remainder accurately below.
+            mp_event_handle_nowait();
+            MP_THREAD_GIL_EXIT();
             taskYIELD();
             MP_THREAD_GIL_ENTER();
-            t1 = esp_timer_get_time();
-            dt = t1 - t0;
+            dt = esp_timer_get_time() - t0;
             break;
-        } else {
-            ulTaskNotifyTake(pdFALSE, 1);
-            MP_THREAD_GIL_ENTER();
         }
+        // The same wait every other blocking path takes, rather than a second
+        // hand-rolled copy of it: one named period decides how promptly a
+        // sleeping task notices a pending KeyboardInterrupt, and this used to
+        // wake once per tick regardless of how long was left to sleep.
+        mp_event_wait_ms((mp_uint_t)((us - dt) / 1000ULL));
     }
     if (dt < us) {
         // do the remaining delay accurately
@@ -258,43 +256,28 @@ uint64_t mp_hal_time_ns(void) {
     return ns;
 }
 
-// Wake up the main task if it is sleeping.
-// The wake descriptor. ESP-IDF's eventfd with EFD_SUPPORT_ISR is the
-// documented mechanism for signalling a select() from an interrupt handler;
-// an lwIP socket cannot be used for this because lwip_sendto() is not
-// callable from an ISR.
-static int wake_fd = -1;
-
-void mp_hal_wake_fd_init(void) {
-    if (wake_fd >= 0) {
-        return;
+// Waits for something to happen, for at most timeout_ms, and never longer than
+// the polling period -- see MICROPY_EVENT_POLL_PERIOD_MS in mphalport.h for why
+// there is a cap at all. A negative timeout means indefinitely, which is the
+// same thing here: the caller will look again when we return.
+//
+// The notification is what mp_hal_wake_main_task() raises, so anything that can
+// wake the task directly still cuts the wait short; the period only bounds how
+// long we wait for the things that cannot.
+void mp_hal_wait_event(int32_t timeout_ms) {
+    uint32_t wait_ms = MICROPY_EVENT_POLL_PERIOD_MS;
+    if (timeout_ms >= 0 && (uint32_t)timeout_ms < wait_ms) {
+        wait_ms = timeout_ms;
     }
-    esp_vfs_eventfd_config_t config = ESP_VFS_EVENTD_CONFIG_DEFAULT();
-    config.max_fds = 1;
-    if (esp_vfs_eventfd_register(&config) != ESP_OK) {
-        return;
+    MP_THREAD_GIL_EXIT();
+    // pdMS_TO_TICKS rounds down, so a sub-tick wait would busy-spin; ask for at
+    // least one tick whenever the caller wanted to wait at all.
+    TickType_t ticks = pdMS_TO_TICKS(wait_ms);
+    if (ticks == 0 && wait_ms != 0) {
+        ticks = 1;
     }
-    wake_fd = eventfd(0, EFD_SUPPORT_ISR);
-}
-
-int mp_hal_wake_fd(void) {
-    return wake_fd;
-}
-
-void mp_hal_wake_fd_signal(void) {
-    if (wake_fd >= 0) {
-        uint64_t one = 1;
-        write(wake_fd, &one, sizeof(one));
-    }
-}
-
-// Only call once select() has reported the descriptor readable: an eventfd
-// read blocks while the counter is zero.
-void mp_hal_wake_fd_drain(void) {
-    if (wake_fd >= 0) {
-        uint64_t discard;
-        read(wake_fd, &discard, sizeof(discard));
-    }
+    ulTaskNotifyTake(pdFALSE, ticks);
+    MP_THREAD_GIL_ENTER();
 }
 
 void mp_hal_wake_main_task(void) {

@@ -415,7 +415,7 @@ static int ringbuf_get_bytes_wait(ringbuf_t *r, uint8_t *data, size_t len, mp_in
     int status = 0;
     while (((status = ringbuf_get_bytes(r, data, len)) == -1)
            && (timeout_ms < 0 || (mp_uint_t)(mp_hal_ticks_ms() - start) < (mp_uint_t)timeout_ms)) {
-        MICROPY_EVENT_POLL_HOOK;
+        mp_event_wait_ms(1);
     }
     return status;
 }
@@ -509,7 +509,7 @@ static void _wait_for_pending_responses(esp_espnow_obj_t *self) {
         }
         if (t > PENDING_RESPONSES_BUSY_POLL_MS) {
             // After 10ms of busy waiting give other tasks a look in.
-            MICROPY_EVENT_POLL_HOOK;
+            mp_event_wait_ms(1);
         }
     }
 }
@@ -550,7 +550,7 @@ static mp_obj_t espnow_send(size_t n_args, const mp_obj_t *args) {
     mp_uint_t start = mp_hal_ticks_ms();
     while ((ESP_ERR_ESPNOW_NO_MEM == (err = esp_now_send(peer, message.buf, message.len)))
            && (mp_uint_t)(mp_hal_ticks_ms() - start) < (mp_uint_t)DEFAULT_SEND_TIMEOUT_MS) {
-        MICROPY_EVENT_POLL_HOOK;
+        mp_event_wait_ms(1);
     }
     check_esp_err(err);           // Will raise OSError if e != ESP_OK
     // Increment the sent packet count. If peer_addr==NULL msg will be

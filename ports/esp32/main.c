@@ -119,9 +119,6 @@ void mp_task(void *pvParameter) {
     uart_stdout_init();
     #endif
     machine_init();
-    // Registered once, before the soft-reset loop: the descriptor has to
-    // outlive a soft reset because ISRs may hold its number.
-    mp_hal_wake_fd_init();
 
     #if MICROPY_SSL_MBEDTLS
     // Configure time function, for mbedtls certificate time validation.
