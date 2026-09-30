@@ -109,6 +109,32 @@ uint32_t mp_hal_get_cpu_freq(void);
 void mp_hal_wake_main_task(void);
 void mp_hal_wake_main_task_from_isr(void);
 
+// How long a wait may last before it goes back and looks again.
+//
+// Nothing on this port wakes a waiting task when a socket becomes readable:
+// lwIP does not know the task exists, and there is no wakeup primitive to tell
+// it. So every wait is really a poll, and this is its period -- the one number
+// that decides how long a ready socket, or a pending KeyboardInterrupt, can sit
+// unnoticed. It used to be one FreeRTOS tick, not because anyone chose that but
+// because the legacy event hook passed a hardcoded 1 to ulTaskNotifyTake() and
+// threw away the caller's timeout. Raising the tick to 1000 Hz for timer
+// accuracy therefore also multiplied the polling cost by ten: at 1 ms a set of
+// ten registered sockets cost 44% of the CPU doing nothing.
+#ifndef MICROPY_EVENT_POLL_PERIOD_MS
+#define MICROPY_EVENT_POLL_PERIOD_MS (10)
+#endif
+
+// Port level Wait-for-Event macro.
+//
+// Do not use this macro directly, include py/runtime.h and call
+// mp_event_wait_indefinite() or mp_event_wait_ms(timeout).
+#define MICROPY_INTERNAL_WFE(TIMEOUT_MS) mp_hal_wait_event(TIMEOUT_MS)
+
+// Waits up to timeout_ms, capped at MICROPY_EVENT_POLL_PERIOD_MS; a negative
+// timeout means "indefinitely", which here means one full period. Returns
+// early if the task is notified (mp_hal_wake_main_task*).
+void mp_hal_wait_event(int32_t timeout_ms);
+
 // C-level pin HAL
 #include "py/obj.h"
 #include "driver/gpio.h"
