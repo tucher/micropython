@@ -60,7 +60,24 @@
 // See note at bottom of file about why this isn't MICROPY_PY_SOCKET
 #if MICROPY_PY_NETWORK
 
-#define SOCKET_POLL_US (100000)
+// How long a blocking socket call waits before coming up for air.
+//
+// This is not a timeout and it does not decide when data is noticed. The socket
+// stays blocking and the slice is imposed with SO_RCVTIMEO, so lwIP returns the
+// instant data arrives; the timeout itself is tracked against the clock (see
+// socket_timed_out). All this period decides is how promptly a thread sitting
+// in recv() notices what arrives through mp_handle_pending(): a
+// KeyboardInterrupt, a callback scheduled from an ISR by micropython.schedule(),
+// an exception scheduled from C.
+//
+// It was 100 ms, unnamed and unexplained, and it is the reason Ctrl-C out of a
+// blocked recv() used to take up to a tenth of a second. The measured cost of
+// the slice is small because a blocked socket sleeps inside lwIP rather than
+// spinning -- see docs/ppp_plan_max.md 11.29 for the curve behind this value.
+#ifndef MICROPY_PY_SOCKET_POLL_PERIOD_MS
+#define MICROPY_PY_SOCKET_POLL_PERIOD_MS (20)
+#endif
+#define SOCKET_POLL_US (MICROPY_PY_SOCKET_POLL_PERIOD_MS * 1000)
 #define MDNS_QUERY_TIMEOUT_MS (5000)
 #define MDNS_LOCAL_SUFFIX ".local"
 
@@ -85,6 +102,9 @@ typedef struct _socket_obj_t {
     // caller's timeout in milliseconds. Kept as the caller gave it rather
     // than as a retry count, so it can actually be honoured.
     uint64_t timeout_ms;
+    // Set while SO_RCVTIMEO holds a shortened final slice rather than the full
+    // polling period; the next blocking call puts the period back.
+    bool slice_trimmed;
     #if MICROPY_PY_SOCKET_EVENTS
     mp_obj_t events_callback;
     struct _socket_obj_t *events_next;
@@ -181,6 +201,48 @@ static bool socket_timed_out(socket_obj_t *sock, mp_uint_t start_ticks) {
 
 static int socket_timeout_errno(socket_obj_t *sock) {
     return sock->timeout_ms == 0 ? MP_EWOULDBLOCK : MP_ETIMEDOUT;
+}
+
+static void socket_set_slice_us(socket_obj_t *sock, uint64_t slice_us) {
+    struct timeval tv = { .tv_sec = 0, .tv_usec = slice_us };
+    lwip_setsockopt(sock->fd, SOL_SOCKET, SO_SNDTIMEO, (const void *)&tv, sizeof(tv));
+    lwip_setsockopt(sock->fd, SOL_SOCKET, SO_RCVTIMEO, (const void *)&tv, sizeof(tv));
+}
+
+// Called once at the top of each blocking operation: if the previous one left a
+// shortened slice behind, restore the full polling period.
+static void socket_slice_reset(socket_obj_t *sock) {
+    if (sock->slice_trimmed) {
+        sock->slice_trimmed = false;
+        socket_set_slice_us(sock, SOCKET_POLL_US);
+    }
+}
+
+// How long the next wait may last: a full polling period, unless less than that
+// is left of the caller's timeout. Without the second half the final slice
+// overshoots by up to a whole period, which is why a 250 ms timeout used to
+// fire at 301 ms.
+static uint64_t socket_slice_us(socket_obj_t *sock, mp_uint_t start_ticks) {
+    uint64_t slice_us = SOCKET_POLL_US;
+    if (sock->timeout_ms == 0 || sock->timeout_ms == UINT64_MAX) {
+        return slice_us;
+    }
+    uint64_t elapsed = (uint64_t)(mp_hal_ticks_ms() - start_ticks);
+    if (elapsed >= sock->timeout_ms) {
+        return 1;           // deadline is up; the loop is about to say so
+    }
+    uint64_t remain_us = (sock->timeout_ms - elapsed) * 1000;
+    return remain_us < slice_us ? (remain_us ? remain_us : 1) : slice_us;
+}
+
+// For the loops that wait inside lwIP via SO_RCVTIMEO. connect() does not use
+// this: it waits in lwip_select() and passes the slice as that call's timeout.
+static void socket_slice_trim(socket_obj_t *sock, mp_uint_t start_ticks) {
+    uint64_t slice_us = socket_slice_us(sock, start_ticks);
+    if (slice_us < SOCKET_POLL_US) {
+        sock->slice_trimmed = true;
+        socket_set_slice_us(sock, slice_us);
+    }
 }
 
 #if MICROPY_HW_ENABLE_MDNS_QUERIES
@@ -374,6 +436,7 @@ static mp_obj_t socket_accept(const mp_obj_t arg0) {
 
     int new_fd = -1;
     mp_uint_t start_ticks = mp_hal_ticks_ms();
+    socket_slice_reset(self);
     for (;;) {
         MP_THREAD_GIL_EXIT();
         new_fd = lwip_accept(self->fd, &addr, &addr_len);
@@ -388,6 +451,7 @@ static mp_obj_t socket_accept(const mp_obj_t arg0) {
             mp_raise_OSError(socket_timeout_errno(self));
         }
         check_for_exceptions();
+        socket_slice_trim(self, start_ticks);
     }
 
     // create new socket object
@@ -465,10 +529,13 @@ static mp_obj_t socket_connect(const mp_obj_t arg0, const mp_obj_t arg1) {
         // or an error or a timeout occurs
 
         mp_uint_t start_ticks = mp_hal_ticks_ms();
+        socket_slice_reset(self);
         for (;;) {
+            // The slice, shortened on the last one so a timeout that is not a
+            // multiple of the period does not overshoot.
             struct timeval timeout = {
                 .tv_sec = 0,
-                .tv_usec = SOCKET_POLL_US,
+                .tv_usec = socket_slice_us(self, start_ticks),
             };
             fd_set wfds;
             FD_ZERO(&wfds);
@@ -601,6 +668,7 @@ void _socket_settimeout(socket_obj_t *sock, uint64_t timeout_ms) {
     // between them; the slice is the shorter of the polling period and what the
     // caller actually asked for, so a timeout below one period is not rounded up.
     sock->timeout_ms = timeout_ms;
+    sock->slice_trimmed = false;
 
     uint64_t slice_us = SOCKET_POLL_US;
     if (timeout_ms == 0) {
@@ -665,6 +733,7 @@ static mp_uint_t _socket_read_data(mp_obj_t self_in, void *buf, size_t size, mp_
     }
 
     mp_uint_t start_ticks = mp_hal_ticks_ms();
+    socket_slice_reset(sock);
     for (;;) {
         // Poll the socket to see if it has waiting data and only release the GIL if it doesn't.
         // This ensures higher performance in the case of many small reads, eg for readline.
@@ -702,6 +771,7 @@ static mp_uint_t _socket_read_data(mp_obj_t self_in, void *buf, size_t size, mp_
             return MP_STREAM_ERROR;
         }
         check_for_exceptions();
+        socket_slice_trim(sock, start_ticks);
     }
 }
 
@@ -747,6 +817,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(socket_recvfrom_obj, 2, 3, socket_rec
 int _socket_send(socket_obj_t *sock, const char *data, size_t datalen) {
     int sentlen = 0;
     mp_uint_t start_ticks = mp_hal_ticks_ms();
+    socket_slice_reset(sock);
     while (sentlen < datalen) {
         MP_THREAD_GIL_EXIT();
         int r = lwip_write(sock->fd, data + sentlen, datalen - sentlen);
@@ -763,6 +834,7 @@ int _socket_send(socket_obj_t *sock, const char *data, size_t datalen) {
             break;
         }
         check_for_exceptions();
+        socket_slice_trim(sock, start_ticks);
     }
     if (sentlen == 0) {
         mp_raise_OSError(socket_timeout_errno(sock));
@@ -808,6 +880,7 @@ static mp_obj_t socket_sendto(mp_obj_t self_in, mp_obj_t data_in, mp_obj_t addr_
 
     // send the data
     mp_uint_t start_ticks = mp_hal_ticks_ms();
+    socket_slice_reset(self);
     for (;;) {
         MP_THREAD_GIL_EXIT();
         int ret = lwip_sendto(self->fd, bufinfo.buf, bufinfo.len, 0, (struct sockaddr *)&to, sizeof(to));
@@ -822,6 +895,7 @@ static mp_obj_t socket_sendto(mp_obj_t self_in, mp_obj_t data_in, mp_obj_t addr_
             mp_raise_OSError(socket_timeout_errno(self));
         }
         check_for_exceptions();
+        socket_slice_trim(self, start_ticks);
     }
 }
 static MP_DEFINE_CONST_FUN_OBJ_3(socket_sendto_obj, socket_sendto);
@@ -845,6 +919,7 @@ static mp_uint_t socket_stream_read(mp_obj_t self_in, void *buf, mp_uint_t size,
 static mp_uint_t socket_stream_write(mp_obj_t self_in, const void *buf, mp_uint_t size, int *errcode) {
     socket_obj_t *sock = self_in;
     mp_uint_t start_ticks = mp_hal_ticks_ms();
+    socket_slice_reset(sock);
     for (;;) {
         MP_THREAD_GIL_EXIT();
         int r = lwip_write(sock->fd, buf, size);
@@ -862,6 +937,7 @@ static mp_uint_t socket_stream_write(mp_obj_t self_in, const void *buf, mp_uint_
             return MP_STREAM_ERROR;
         }
         check_for_exceptions();
+        socket_slice_trim(sock, start_ticks);
     }
 }
 
@@ -1241,71 +1317,6 @@ static MP_DEFINE_CONST_OBJ_TYPE(
     locals_dict, &getaddrinfo_req_locals_dict
     );
 
-// TEMPORARY, for the W3b decision: what does a wait cost when the set has to
-// carry the wake descriptor as well as sockets? A mixed set cannot go to
-// lwip_select() and lands in esp_vfs_select(), whose cost grows with the
-// highest fd number -- and lwIP puts sockets at the top of the fd space.
-// Remove once W3b has picked its design.
-static mp_obj_t esp_socket_select_cost(mp_obj_t n_in) {
-    int n = mp_obj_get_int(n_in);
-    if (n < 0 || n > 8) {
-        mp_raise_ValueError(NULL);
-    }
-    int fds[8];
-    int maxfd = 0;
-    for (int i = 0; i < n; i++) {
-        fds[i] = lwip_socket(AF_INET, SOCK_DGRAM, 0);
-        struct sockaddr_in a = { 0 };
-        a.sin_family = AF_INET;
-        a.sin_port = lwip_htons(12300 + i);
-        lwip_bind(fds[i], (struct sockaddr *)&a, sizeof(a));
-        if (fds[i] > maxfd) {
-            maxfd = fds[i];
-        }
-    }
-    int wake = mp_hal_wake_fd();
-
-    const int reps = 100;
-    struct timeval tv = { 0, 0 };
-    fd_set rfds;
-
-    // 1. socket-only set through lwip_select()
-    int64_t t0 = esp_timer_get_time();
-    for (int r = 0; r < reps; r++) {
-        FD_ZERO(&rfds);
-        for (int i = 0; i < n; i++) {
-            FD_SET(fds[i], &rfds);
-        }
-        lwip_select(maxfd + 1, &rfds, NULL, NULL, &tv);
-    }
-    int64_t lwip_us = (esp_timer_get_time() - t0) / reps;
-
-    // 2. same set plus the wake descriptor, through the VFS select()
-    int mixed_max = maxfd > wake ? maxfd : wake;
-    t0 = esp_timer_get_time();
-    for (int r = 0; r < reps; r++) {
-        FD_ZERO(&rfds);
-        for (int i = 0; i < n; i++) {
-            FD_SET(fds[i], &rfds);
-        }
-        if (wake >= 0) {
-            FD_SET(wake, &rfds);
-        }
-        select(mixed_max + 1, &rfds, NULL, NULL, &tv);
-    }
-    int64_t mixed_us = (esp_timer_get_time() - t0) / reps;
-
-    for (int i = 0; i < n; i++) {
-        lwip_close(fds[i]);
-    }
-    mp_obj_t res[4] = {
-        mp_obj_new_int(lwip_us), mp_obj_new_int(mixed_us),
-        mp_obj_new_int(maxfd), mp_obj_new_int(wake),
-    };
-    return mp_obj_new_tuple(4, res);
-}
-static MP_DEFINE_CONST_FUN_OBJ_1(esp_socket_select_cost_obj, esp_socket_select_cost);
-
 static mp_obj_t esp_socket_initialize() {
     static int initialized = 0;
     if (!initialized) {
@@ -1324,7 +1335,6 @@ static const mp_rom_map_elem_t mp_module_socket_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_getaddrinfo), MP_ROM_PTR(&esp_socket_getaddrinfo_obj) },
     // Private: the non-blocking half, used by asyncio's Loop.getaddrinfo().
     { MP_ROM_QSTR(MP_QSTR__getaddrinfo_start), MP_ROM_PTR(&esp_socket_getaddrinfo_start_obj) },
-    { MP_ROM_QSTR(MP_QSTR__select_cost), MP_ROM_PTR(&esp_socket_select_cost_obj) },
 
     { MP_ROM_QSTR(MP_QSTR_AF_INET), MP_ROM_INT(AF_INET) },
     { MP_ROM_QSTR(MP_QSTR_AF_INET6), MP_ROM_INT(AF_INET6) },
