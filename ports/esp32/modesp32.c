@@ -31,6 +31,7 @@
 #include <sys/time.h>
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "multi_heap.h"
 
 #include "py/nlr.h"
@@ -315,6 +316,72 @@ static mp_obj_t esp32_idf_task_info(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(esp32_idf_task_info_obj, esp32_idf_task_info);
 #endif
 
+// The hardware reason for the last reset, as ESP-IDF reports it. machine.reset_cause()
+// folds these together -- a deliberate machine.reset() and a panic are both
+// HARD_RESET, a power-on and a brownout both PWRON_RESET -- which is too coarse
+// for a device that has to tell a crash or a sagging supply from a planned
+// restart. Unlike reset_cause() it is untouched by a soft reset: it is the
+// reason since the chip last started.
+static mp_obj_t esp32_reset_reason(void) {
+    qstr name;
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:
+            name = MP_QSTR_POWERON;
+            break;
+        case ESP_RST_EXT:
+            name = MP_QSTR_EXT;
+            break;
+        case ESP_RST_SW:
+            name = MP_QSTR_SW;
+            break;
+        case ESP_RST_PANIC:
+            name = MP_QSTR_PANIC;
+            break;
+        case ESP_RST_INT_WDT:
+            name = MP_QSTR_INT_WDT;
+            break;
+        case ESP_RST_TASK_WDT:
+            name = MP_QSTR_TASK_WDT;
+            break;
+        case ESP_RST_WDT:
+            name = MP_QSTR_WDT;
+            break;
+        case ESP_RST_DEEPSLEEP:
+            name = MP_QSTR_DEEPSLEEP;
+            break;
+        case ESP_RST_BROWNOUT:
+            name = MP_QSTR_BROWNOUT;
+            break;
+        case ESP_RST_SDIO:
+            name = MP_QSTR_SDIO;
+            break;
+        #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+        case ESP_RST_USB:
+            name = MP_QSTR_USB;
+            break;
+        case ESP_RST_JTAG:
+            name = MP_QSTR_JTAG;
+            break;
+        #endif
+        #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+        case ESP_RST_EFUSE:
+            name = MP_QSTR_EFUSE;
+            break;
+        case ESP_RST_PWR_GLITCH:
+            name = MP_QSTR_PWR_GLITCH;
+            break;
+        case ESP_RST_CPU_LOCKUP:
+            name = MP_QSTR_CPU_LOCKUP;
+            break;
+        #endif
+        default:
+            name = MP_QSTR_UNKNOWN;
+            break;
+    }
+    return MP_OBJ_NEW_QSTR(name);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(esp32_reset_reason_obj, esp32_reset_reason);
+
 static const mp_rom_map_elem_t esp32_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_esp32) },
 
@@ -334,6 +401,7 @@ static const mp_rom_map_elem_t esp32_module_globals_table[] = {
     #if SOC_GPIO_SUPPORT_HOLD_IO_IN_DSLP && !SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP
     { MP_ROM_QSTR(MP_QSTR_gpio_deep_sleep_hold), MP_ROM_PTR(&esp32_gpio_deep_sleep_hold_obj) },
     #endif
+    { MP_ROM_QSTR(MP_QSTR_reset_reason), MP_ROM_PTR(&esp32_reset_reason_obj) },
     #if CONFIG_IDF_TARGET_ESP32
     { MP_ROM_QSTR(MP_QSTR_raw_temperature), MP_ROM_PTR(&esp32_raw_temperature_obj) },
     #else
