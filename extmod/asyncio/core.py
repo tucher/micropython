@@ -98,17 +98,30 @@ class IOQueue:
         self._enqueue(s, 1)
 
     def remove(self, task):
+        # Only the task's own wait goes. A stream one task reads and another
+        # writes stays polled for the other: dequeuing the whole entry would
+        # leave that task waiting for an event nobody looks for any more --
+        # never woken, not even by the stream closing.
         while True:
-            del_s = None
+            found = None
             for k in self.map:  # Iterate without allocating on the heap
-                q0, q1, s = self.map[k]
-                if q0 is task or q1 is task:
-                    del_s = s
+                sm = self.map[k]
+                if sm[0] is task or sm[1] is task:
+                    found = sm
                     break
-            if del_s is not None:
-                self._dequeue(s)
-            else:
+            if found is None:
                 break
+            if found[0] is task:
+                found[0] = None
+            if found[1] is task:
+                found[1] = None
+            s = found[2]
+            if found[0] is None and found[1] is None:
+                self._dequeue(s)
+            elif found[0] is None:
+                self.poller.modify(s, select.POLLOUT)
+            else:
+                self.poller.modify(s, select.POLLIN)
 
     def wait_io_event(self, dt):
         for s, ev in self.poller.ipoll(dt):
