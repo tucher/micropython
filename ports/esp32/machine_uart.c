@@ -173,6 +173,10 @@ static bool uart_timer_callback(machine_timer_obj_t *timer) {
     return false;
 }
 
+// How long the C sink waits for a buffer to fill: at 921600 baud, more than
+// a buffer's worth of line time, and nothing next to PPP's own timers.
+#define UART_SINK_GATHER_MS (5)
+
 static void uart_event_task(void *self_in) {
     machine_uart_obj_t *self = MP_OBJ_TO_PTR(self_in);
     uart_event_t event;
@@ -186,15 +190,28 @@ static void uart_event_task(void *self_in) {
                     if (self->c_sink != NULL) {
                         // C consumer: drain the driver here and now. No timer,
                         // no scheduler, no dependency on the VM making progress.
+                        //
+                        // A buffer at a time, waiting a moment for it to fill:
+                        // the modem hands a burst over a few bytes at a time,
+                        // and taking each few as it came was an interrupt, a
+                        // read, a pbuf and a message to lwIP for each -- in
+                        // thousands, at this task's priority on the VM's core.
+                        // A TLS server's answer over PPP took the VM off its
+                        // core for most of half a second. Blocked in the wait,
+                        // this task leaves the core to the VM; the bytes keep
+                        // arriving in the driver's ring meanwhile.
                         uint8_t buf[256];
                         self->c_sink_running = true;
                         mp_stream_data_sink_t sink = self->c_sink;
                         while (sink != NULL) {
-                            int n = uart_read_bytes(self->uart_num, buf, sizeof(buf), 0);
+                            int n = uart_read_bytes(self->uart_num, buf, sizeof(buf), pdMS_TO_TICKS(UART_SINK_GATHER_MS));
                             if (n <= 0) {
                                 break;
                             }
                             sink(self->c_sink_ctx, buf, n);
+                            if (n < (int)sizeof(buf)) {
+                                break;          // the ring emptied: the bytes behind bring their own events
+                            }
                             sink = self->c_sink;
                         }
                         self->c_sink_running = false;
