@@ -116,6 +116,9 @@ typedef struct _mp_obj_ssl_socket_t {
 
     uintptr_t poll_mask; // Indicates which read or write operations the protocol needs next
     int last_error; // The last error code, if any
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    bool computing; // A restartable ECC computation is under way: ready again at once
+    #endif
 
     #ifdef MBEDTLS_SSL_PROTO_DTLS
     mp_uint_t timer_start_ms;
@@ -123,6 +126,12 @@ typedef struct _mp_obj_ssl_socket_t {
     mp_uint_t timer_int_ms;
     #endif
 } mp_obj_ssl_socket_t;
+
+// Restartable ECC (MBEDTLS_ECP_RESTARTABLE): the most basic operations done in
+// a row before a handshake yields; 0, the default, does it all in one call.
+#ifndef MICROPY_SSL_MBEDTLS_ECP_MAX_OPS
+#define MICROPY_SSL_MBEDTLS_ECP_MAX_OPS (0)
+#endif
 
 static const mp_obj_type_t ssl_context_type;
 static const mp_obj_type_t ssl_socket_type;
@@ -760,12 +769,22 @@ static mp_obj_t ssl_socket_make_new(mp_obj_ssl_context_t *ssl_context, mp_obj_t 
     o->ssl_context = ssl_context;
     o->sock = sock;
     o->poll_mask = 0;
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    o->computing = false;
+    #endif
     o->last_error = 0;
 
     int ret;
     uint32_t flags = 0;
 
     mbedtls_ssl_init(&o->ssl);
+
+    #if defined(MBEDTLS_ECP_RESTARTABLE) && MICROPY_SSL_MBEDTLS_ECP_MAX_OPS
+    // ECC in pieces of this many basic operations: a handshake (TLS 1.2,
+    // ECDHE-ECDSA) yields between them instead of holding the VM in one call.
+    // A global of mbedtls's; the same value every time.
+    mbedtls_ecp_set_max_ops(MICROPY_SSL_MBEDTLS_ECP_MAX_OPS);
+    #endif
 
     ret = mbedtls_ssl_setup(&o->ssl, &ssl_context->conf);
     #if !MICROPY_MBEDTLS_CONFIG_BARE_METAL
@@ -817,7 +836,11 @@ static mp_obj_t ssl_socket_make_new(mp_obj_ssl_context_t *ssl_context, mp_obj_t 
 
     if (do_handshake_on_connect) {
         while ((ret = mbedtls_ssl_handshake(&o->ssl)) != 0) {
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE
+                #if defined(MBEDTLS_ECP_RESTARTABLE)
+                && ret != MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS
+                #endif
+                ) {
                 goto cleanup;
             }
             mp_event_wait_ms(1);
@@ -876,6 +899,9 @@ static MP_DEFINE_CONST_FUN_OBJ_1(mod_ssl_cipher_obj, mod_ssl_cipher);
 static mp_uint_t socket_read(mp_obj_t o_in, void *buf, mp_uint_t size, int *errcode) {
     mp_obj_ssl_socket_t *o = MP_OBJ_TO_PTR(o_in);
     o->poll_mask = 0;
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    o->computing = false;
+    #endif
 
     if (o->last_error) {
         *errcode = o->last_error;
@@ -895,6 +921,13 @@ static mp_uint_t socket_read(mp_obj_t o_in, void *buf, mp_uint_t size, int *errc
     }
     if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
         ret = MP_EWOULDBLOCK;
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    } else if (ret == MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS) {
+        // A piece of a restartable ECC computation done (mbedtls_ecp_set_max_ops):
+        // the handshake goes on at the next read, once others have had their turn.
+        ret = MP_EWOULDBLOCK;
+        o->computing = true;
+    #endif
     } else if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
         // If handshake is not finished, read attempt may end up in protocol
         // wanting to write next handshake message. The same may happen with
@@ -920,6 +953,9 @@ static mp_uint_t socket_read(mp_obj_t o_in, void *buf, mp_uint_t size, int *errc
 static mp_uint_t socket_write(mp_obj_t o_in, const void *buf, mp_uint_t size, int *errcode) {
     mp_obj_ssl_socket_t *o = MP_OBJ_TO_PTR(o_in);
     o->poll_mask = 0;
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    o->computing = false;
+    #endif
 
     if (o->last_error) {
         *errcode = o->last_error;
@@ -935,6 +971,12 @@ static mp_uint_t socket_write(mp_obj_t o_in, const void *buf, mp_uint_t size, in
     }
     if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
         ret = MP_EWOULDBLOCK;
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    } else if (ret == MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS) {
+        // As in socket_read: the computation goes on at the next write.
+        ret = MP_EWOULDBLOCK;
+        o->computing = true;
+    #endif
     } else if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
         // If handshake is not finished, write attempt may end up in protocol
         // wanting to read next handshake message. The same may happen with
@@ -980,6 +1022,14 @@ static mp_uint_t socket_ioctl(mp_obj_t o_in, mp_uint_t request, uintptr_t arg, i
             // Closed or error socket, return NVAL flag.
             return MP_STREAM_POLL_NVAL;
         }
+
+        #if defined(MBEDTLS_ECP_RESTARTABLE)
+        if (self->computing) {
+            // Nothing to wait for on the socket: the caller is to come back and
+            // compute on, after the other tasks have had their turn.
+            return arg & MP_STREAM_POLL_RDWR;
+        }
+        #endif
 
         // If the library signaled us that it needs reading or writing, only check that direction,
         // but save what the caller asked because we need to restore it later
