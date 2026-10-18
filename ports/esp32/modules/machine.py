@@ -78,19 +78,33 @@ if hasattr(esp32, "PCNT"):
             self._overflows = 0
             self._offset = 0
 
-            # Install IRQ handler to handle under/overflow.
-            self._pcnt.irq(self._overflow, self._PCNT.IRQ_MIN | self._PCNT.IRQ_MAX)
+            # Install IRQ handler to handle under/overflow, and a match if
+            # one is armed.
+            self._arm()
 
             # Start counting.
             self._pcnt.start()
 
-        # Handle counter under/overflow.
-        def _overflow(self, pcnt):
+        def _arm(self):
+            trigger = self._PCNT.IRQ_MIN | self._PCNT.IRQ_MAX
+            if getattr(self, "_armed", 0):
+                trigger |= self._PCNT.IRQ_THRESHOLD0
+            self._pcnt.irq(self._event, trigger)
+
+        # Handle counter under/overflow, and a match.
+        def _event(self, pcnt):
             mask = pcnt.irq().flags()
             if mask & self._PCNT.IRQ_MIN:
                 self._overflows -= 1
             elif mask & self._PCNT.IRQ_MAX:
                 self._overflows += 1
+            if mask & self._PCNT.IRQ_THRESHOLD0 and getattr(self, "_armed", 0):
+                # One-shot, as on other ports: armed again by irq() or
+                # irq().trigger().
+                self._armed = 0
+                self._flags |= Counter.IRQ_MATCH
+                self._arm()
+                self._handler(self)
 
         # Public machine.Counter & machine.Encoder API.
         def init(self, *args, **kwargs):
@@ -132,22 +146,61 @@ if hasattr(esp32, "PCNT"):
 
             return result
 
+    class _CounterIRQ:
+        def __init__(self, counter):
+            self._counter = counter
+
+        def flags(self):
+            flags, self._counter._flags = self._counter._flags, 0
+            return flags
+
+        def trigger(self, trigger=None):
+            counter = self._counter
+            if trigger is not None:
+                counter._armed = trigger if counter._handler else 0
+                counter._arm()
+            return counter._armed
+
     class Counter(_CounterBase):
         # Public machine.Counter API.
         RISING = 1
         FALLING = 2
         UP = _CounterBase._PCNT.INCREMENT
         DOWN = _CounterBase._PCNT.DECREMENT
+        IRQ_MATCH = _CounterBase._PCNT.IRQ_THRESHOLD0
 
         # Counter-specific configuration.
-        def _configure(self, src, edge=RISING, direction=UP):
+        def _configure(self, src, edge=RISING, direction=UP, match=None):
+            # The PCNT compares its own count, and takes a new threshold only
+            # when the count is cleared -- which init() then does. So a match
+            # is the count from init(), within the hardware's range.
+            if match is not None and not -_PCNT_RANGE < match < _PCNT_RANGE:
+                raise ValueError("match")
             # Only use the first channel.
             self._pcnt.init(
                 channel=0,
                 pin=src,
                 rising=direction if edge & Counter.RISING else self._PCNT.IGNORE,
                 falling=direction if edge & Counter.FALLING else self._PCNT.IGNORE,
+                threshold0=0 if match is None else match,
             )
+            self._match = match
+            if not hasattr(self, "_handler"):
+                self._handler = None
+                self._armed = 0
+                self._flags = 0
+            elif match is None:
+                self._armed = 0
+
+        # Public machine.Counter API.
+        def irq(self, handler=None, trigger=0, hard=False):
+            if hard:
+                raise ValueError("hard IRQs are not implemented")
+            self._handler = handler
+            self._armed = trigger if handler else 0
+            self._flags = 0
+            self._arm()
+            return _CounterIRQ(self)
 
     class Encoder(_CounterBase):
         # Encoder-specific configuration.

@@ -82,7 +82,12 @@ Methods
      The value is not checked for being in the bounds of the counter range. This option
      if equivalent to the *threshold* options of the ESP32 PCNT module.
      A *value* of *None* resets the match value and disables the IRQ_MATCH interrupt.
-     *(Supported on MIMXRT)*
+     *(Supported on MIMXRT and ESP32)*
+
+     On ESP32 the PCNT compares its own count and takes a new match only when
+     its count is cleared, which ``init()`` does: the match counts from
+     ``init()``, must lie within the hardware counter's range of +/-32000, and
+     :meth:`Counter.value` setting a value does not move it.
 
    - *match_pin* A Pin specifier telling to which pin the match output is connected.
      This output will have a high level as long as the counter matches the
@@ -154,7 +159,8 @@ Methods
    Therefore the position match callback is run in a one-shot fashion, and has to be enabled
    again when the position has changed. It will be enabled by re-defining the trigger with either
    :meth:`Counter.irq()` or :meth:`irq().trigger()`. For ESP32, Counter interrupts are handled
-   by the :ref:`PCNT<esp32.PCNT>`. *(Supported on MIMXRT)*
+   by the :ref:`PCNT<esp32.PCNT>`. *(Supported on MIMXRT, and on ESP32 for IRQ_MATCH, with
+   the handler always a scheduled function: hard=True raises ValueError)*
 
 Constants
 ---------
@@ -175,4 +181,4 @@ Constants
           Counter.IRQ_ROLL_OVER
           Counter.IRQ_ROLL_UNDER
 
-   Select the IRQ trigger event.  *(Supported on MIMXRT)*
+   Select the IRQ trigger event.  *(Supported on MIMXRT; IRQ_MATCH also on ESP32)*

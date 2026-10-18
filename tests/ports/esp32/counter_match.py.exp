@@ -1,0 +1,5 @@
+called once: True
+for the match: True
+at or after 500: True
+counting went on: True
+hard=True: ValueError
