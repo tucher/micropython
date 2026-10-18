@@ -39,11 +39,17 @@ class Stream:
         return self.e[v]
 
     def close(self):
-        pass
+        # Close now, unless write() holds data drain() has not sent yet:
+        # wait_closed() sends that first, then closes.
+        if not self.out_buf:
+            self.s.close()
 
     async def wait_closed(self):
-        # TODO yield?
-        self.s.close()
+        try:
+            if self.out_buf:
+                await self.drain()
+        finally:
+            self.s.close()
 
     # async
     def read(self, n=-1):
