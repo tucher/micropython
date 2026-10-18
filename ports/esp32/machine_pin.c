@@ -336,15 +336,22 @@ static MP_DEFINE_CONST_FUN_OBJ_1(machine_pin_toggle_obj, machine_pin_toggle);
 
 // pin.irq(handler=None, trigger=IRQ_FALLING|IRQ_RISING)
 static mp_obj_t machine_pin_irq(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    enum { ARG_handler, ARG_trigger, ARG_wake };
+    enum { ARG_handler, ARG_trigger, ARG_wake, ARG_hard };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_handler, MP_ARG_OBJ, {.u_obj = mp_const_none} },
         { MP_QSTR_trigger, MP_ARG_INT, {.u_int = GPIO_INTR_POSEDGE | GPIO_INTR_NEGEDGE} },
         { MP_QSTR_wake, MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_hard, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
     };
     machine_pin_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    // The handler is always run by the scheduler: say so rather than run a
+    // hard=True handler soft without a word.
+    if (args[ARG_hard].u_bool) {
+        mp_raise_ValueError(MP_ERROR_TEXT("hard IRQs are not implemented"));
+    }
 
     if (n_args > 1 || kw_args->used != 0) {
         // configure irq
