@@ -32,6 +32,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 #include "esp_task.h"
 #include "shared/runtime/mpirq.h"
 
@@ -141,6 +142,11 @@ typedef struct _machine_uart_obj_t {
     SemaphoreHandle_t c_sink_lock;
     volatile bool c_sink_detaching; // asks a drain in progress to stop early
     volatile uint32_t rx_overrun;   // FIFO overflows + ring-buffer-full events
+    // The C writer's own queue, and the task that feeds the driver from it
+    // (MP_STREAM_GET_C_WRITER).
+    StreamBufferHandle_t c_tx;
+    volatile TaskHandle_t c_tx_task;
+    volatile bool c_tx_stop;
     volatile uint32_t tx_congested; // writes refused because the TX ring was full
     volatile uint16_t tx_max_write;  // largest single write the C writer was asked for
 } machine_uart_obj_t;
@@ -556,6 +562,9 @@ static mp_obj_t mp_machine_uart_make_new(const mp_obj_type_t *type, size_t n_arg
         self->c_sink_lock = NULL;
         self->c_sink_detaching = false;
         self->rx_overrun = 0;
+        self->c_tx = NULL;
+        self->c_tx_task = NULL;
+        self->c_tx_stop = false;
         self->tx_congested = 0;
         self->tx_max_write = 0;
         // remaining fields are set from inside mp_machine_uart_init_helper()
@@ -573,7 +582,10 @@ static mp_obj_t mp_machine_uart_make_new(const mp_obj_type_t *type, size_t n_arg
     return MP_OBJ_FROM_PTR(self);
 }
 
+static void uart_c_tx_stop(machine_uart_obj_t *self);
+
 static void mp_machine_uart_deinit(machine_uart_obj_t *self) {
+    uart_c_tx_stop(self);
     if (self->uart_event_task != NULL) {
         // Not while it calls the sink: deleted holding c_sink_lock, the task
         // would never give it back.
@@ -809,26 +821,54 @@ static mp_uint_t mp_machine_uart_write(mp_obj_t self_in, const void *buf_in, mp_
     return bytes_written;
 }
 
-// Non-blocking write for MP_STREAM_GET_C_WRITER. Checks the TX ring has room
-// before handing data to uart_write_bytes(), which would otherwise block until
-// it fits -- and the caller here is typically lwIP's tcpip thread, which must
-// never wait on a UART. A refused write is reported as 0 bytes, i.e. link
-// congestion, which the caller is expected to handle (TCP retransmits).
+// Feeds the driver from the C writer's queue. uart_write_bytes() may wait
+// here for its ring to have room; this task is the one place that waiting
+// stops nothing. It leaves when asked, never in the middle of a write: a task
+// deleted holding the driver's TX lock would keep it forever.
+static void uart_c_tx_task(void *self_in) {
+    machine_uart_obj_t *self = self_in;
+    uint8_t buf[256];
+    while (!self->c_tx_stop) {
+        size_t n = xStreamBufferReceive(self->c_tx, buf, sizeof(buf), pdMS_TO_TICKS(100));
+        if (n > 0) {
+            uart_write_bytes(self->uart_num, buf, n);
+        }
+    }
+    self->c_tx_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void uart_c_tx_stop(machine_uart_obj_t *self) {
+    if (self->c_tx_task != NULL) {
+        self->c_tx_stop = true;
+        while (self->c_tx_task != NULL) {
+            vTaskDelay(1);
+        }
+        self->c_tx_stop = false;
+    }
+    if (self->c_tx != NULL) {
+        vStreamBufferDelete(self->c_tx);
+        self->c_tx = NULL;
+    }
+}
+
+// Non-blocking write for MP_STREAM_GET_C_WRITER; the caller is typically
+// lwIP's tcpip thread, which must never wait on a UART. All or nothing: the
+// writer's own queue says exactly how much it can take, and only this writer
+// adds to it, so a frame either goes in whole or is refused -- reported as 0
+// bytes, link congestion, which TCP retransmits. The driver's own count of
+// free TX space is no use for this: uart_get_tx_buffer_free_size() leaves out
+// the frames already queued, and uart_write_bytes() then blocks.
 static size_t machine_uart_c_write(void *ctx, const uint8_t *buf, size_t len) {
     machine_uart_obj_t *self = ctx;
     if (len > self->tx_max_write) {
         self->tx_max_write = len;
     }
-    size_t free_size = 0;
-    if (uart_get_tx_buffer_free_size(self->uart_num, &free_size) != ESP_OK) {
-        return 0;
-    }
-    if (free_size < len) {
+    if (xStreamBufferSpacesAvailable(self->c_tx) < len) {
         self->tx_congested++;
         return 0;
     }
-    int written = uart_write_bytes(self->uart_num, buf, len);
-    return written < 0 ? 0 : (size_t)written;
+    return xStreamBufferSend(self->c_tx, buf, len, 0);
 }
 
 static mp_uint_t mp_machine_uart_ioctl(mp_obj_t self_in, mp_uint_t request, uintptr_t arg, int *errcode) {
@@ -904,11 +944,23 @@ static mp_uint_t mp_machine_uart_ioctl(mp_obj_t self_in, mp_uint_t request, uint
             *errcode = MP_EINVAL;
             return MP_STREAM_ERROR;
         }
+        if (self->c_tx == NULL) {
+            self->c_tx = xStreamBufferCreate(self->txbuf, 1);
+            if (self->c_tx == NULL) {
+                *errcode = MP_ENOMEM;
+                return MP_STREAM_ERROR;
+            }
+        }
+        if (self->c_tx_task == NULL
+            && xTaskCreatePinnedToCore(uart_c_tx_task, "uart_tx_task", 2048, self,
+                ESP_TASKD_EVENT_PRIO, (TaskHandle_t *)&self->c_tx_task, MP_TASK_COREID) != pdPASS) {
+            *errcode = MP_ENOMEM;
+            return MP_STREAM_ERROR;
+        }
         mp_stream_c_writer_t *w = (mp_stream_c_writer_t *)arg;
         w->write = machine_uart_c_write;
         w->ctx = self;
-        // The ring is the whole of it: machine_uart_c_write() refuses anything
-        // that does not fit in the free space, and an idle ring is all free.
+        // The queue is the whole of it: an idle one takes this much at once.
         w->max_write = self->txbuf;
         ret = 0;
     } else {
