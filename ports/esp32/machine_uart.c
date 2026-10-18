@@ -243,9 +243,18 @@ static void uart_event_task(void *self_in) {
     }
 }
 
+// The event task runs no Python, and at its priority on the VM's core it
+// takes the core from the VM for as long as it works. On a chip with two
+// cores it goes on the other one.
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+#define UART_EVENT_TASK_COREID (MP_TASK_COREID == 0 ? 1 : 0)
+#else
+#define UART_EVENT_TASK_COREID (MP_TASK_COREID)
+#endif
+
 static inline void uart_event_task_create(machine_uart_obj_t *self) {
     if (xTaskCreatePinnedToCore(uart_event_task, "uart_event_task", 2048, self,
-        ESP_TASKD_EVENT_PRIO, (TaskHandle_t *)&self->uart_event_task, MP_TASK_COREID) != pdPASS) {
+        ESP_TASKD_EVENT_PRIO, (TaskHandle_t *)&self->uart_event_task, UART_EVENT_TASK_COREID) != pdPASS) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("failed to create UART event task"));
     }
 }
