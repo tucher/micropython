@@ -109,7 +109,11 @@ class SSLContext
      sockets (i.e. when the *sock* passed into ``wrap_socket`` is in non-blocking mode)
      the handshake should generally be deferred because otherwise ``wrap_socket`` blocks
      until it completes. Note that in AXTLS the handshake can be deferred until the first
-     read or write but it then blocks until completion.
+     read or write but it then blocks until completion. With mbedTLS a deferred handshake
+     can also be driven on its own with ``do_handshake()``, as in CPython: on a non-blocking
+     socket it raises ``OSError(EAGAIN)`` until the handshake is over, and polling the
+     socket says when to call it again. ``asyncio.open_connection()`` uses it, so a
+     certificate the context refuses is refused there rather than at the first write.
 
    - *server_hostname* is for use as a client, and sets the hostname to check against the received
      server certificate.  It also sets the name for Server Name Indication (SNI), allowing the server
