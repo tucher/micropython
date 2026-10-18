@@ -161,8 +161,26 @@ def create_task(coro):
     return t
 
 
+# The loop's state is module-global, so a second loop started from inside a
+# running one would share and corrupt its queues. Refuse it, as CPython does,
+# before anything is queued.
+def _not_running():
+    if _running:
+        raise RuntimeError("event loop is already running")
+
+
 # Keep scheduling tasks until there are none left to schedule
 def run_until_complete(main_task=None):
+    global _running
+    _not_running()
+    _running = True
+    try:
+        return _run_until_complete(main_task)
+    finally:
+        _running = False
+
+
+def _run_until_complete(main_task):
     global cur_task
     excs_all = (CancelledError, Exception)  # To prevent heap allocation in loop
     excs_stop = (CancelledError, StopIteration)  # To prevent heap allocation in loop
@@ -258,6 +276,7 @@ def run_until_complete(main_task=None):
 
 # Create a new task from a coroutine and run it until it finishes
 def run(coro):
+    _not_running()
     return run_until_complete(create_task(coro))
 
 
@@ -271,6 +290,7 @@ async def _stopper():
 
 cur_task = None
 _stop_task = None
+_running = False
 
 
 class Loop:
@@ -281,11 +301,13 @@ class Loop:
 
     def run_forever():
         global _stop_task
+        _not_running()
         _stop_task = Task(_stopper(), globals())
         run_until_complete(_stop_task)
         # TODO should keep running until .stop() is called, even if there're no tasks left
 
     def run_until_complete(aw):
+        _not_running()
         return run_until_complete(_promote_to_task(aw))
 
     def stop():
