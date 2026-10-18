@@ -411,6 +411,15 @@ static mp_obj_t process_import_at_level(qstr full_mod_name, qstr level_mod_name,
         if (stat == MP_IMPORT_STAT_NO_EXIST) {
             module_obj = mp_module_get_builtin(level_mod_name, true);
             if (module_obj != MP_OBJ_NULL) {
+                #if MICROPY_PY_SYS && MICROPY_PY_SYS_PATH
+                // Nothing on sys.path extends it: keep it loaded, so that the
+                // next import does not search the filesystem again. Not with
+                // sys.path empty, which is how a module extending it imports
+                // the built-in -- that module is the one loaded by this name.
+                if (path_num) {
+                    mp_map_lookup(&MP_STATE_VM(mp_loaded_modules_dict).map, MP_OBJ_NEW_QSTR(full_mod_name), MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value = module_obj;
+                }
+                #endif
                 return module_obj;
             }
         }
