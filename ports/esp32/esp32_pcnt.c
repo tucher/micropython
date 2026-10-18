@@ -277,9 +277,13 @@ static mp_obj_t esp32_pcnt_make_new(const mp_obj_type_t *type, size_t n_pos_args
     mp_map_init_fixed_table(&kw_args, n_kw_args, args + n_pos_args);
     esp32_pcnt_init_helper(self, 0, args + n_pos_args, &kw_args);
 
-    // Ensure the global PCNT ISR service is installed.
+    // Ensure the global PCNT ISR service is installed. Not in IRAM: the
+    // handler reads the event status through the driver and hands it to
+    // mp_irq_handler(), both in flash, and its object lives on the GC heap,
+    // which may be in PSRAM. An IRAM ISR runs while a flash write has the
+    // cache off, and would fault on any of them; this one waits for it.
     if (!pcnt_isr_service_installed) {
-        check_esp_err(pcnt_isr_service_install(ESP_INTR_FLAG_IRAM));
+        check_esp_err(pcnt_isr_service_install(0));
         pcnt_isr_service_installed = true;
     }
 
@@ -404,7 +408,7 @@ static const mp_irq_methods_t esp32_pcnt_irq_methods = {
     .info = esp32_pcnt_irq_info,
 };
 
-static IRAM_ATTR void esp32_pcnt_intr_handler(void *arg) {
+static void esp32_pcnt_intr_handler(void *arg) {
     esp32_pcnt_obj_t *self = (esp32_pcnt_obj_t *)arg;
     pcnt_unit_t unit = self->unit;
     uint32_t status;
