@@ -187,20 +187,10 @@ static bool uart_timer_callback(machine_timer_obj_t *timer) {
     return false;
 }
 
-// How long the C sink waits for a buffer to fill: at 921600 baud, more than
-// a buffer's worth of line time, and nothing next to PPP's own timers.
-#define UART_SINK_GATHER_MS (5)
-
 // Hand what the driver holds to the C sink, if one is attached; false if
-// none is. Under c_sink_lock, so a detach waits for this to finish.
-//
-// A buffer at a time, waiting a moment for it to fill: the modem hands a
-// burst over a few bytes at a time, and taking each few as it came was an
-// interrupt, a read, a pbuf and a message to lwIP for each -- in thousands,
-// at this task's priority on the VM's core. A TLS server's answer over PPP
-// took the VM off its core for most of half a second. Blocked in the wait,
-// this task leaves the core to the VM; the bytes keep arriving in the
-// driver's ring meanwhile.
+// none is. Under c_sink_lock, so a detach waits for this to finish. How many
+// bytes each event brings is the UART's to say, through its RX FIFO
+// threshold and timeout, which timeout_char sets.
 static bool uart_sink_drain(machine_uart_obj_t *self) {
     xSemaphoreTake(self->c_sink_lock, portMAX_DELAY);
     mp_stream_data_sink_t sink = self->c_sink;
@@ -208,14 +198,11 @@ static bool uart_sink_drain(machine_uart_obj_t *self) {
     if (sink != NULL) {
         uint8_t buf[256];
         while (!self->c_sink_detaching) {
-            int n = uart_read_bytes(self->uart_num, buf, sizeof(buf), pdMS_TO_TICKS(UART_SINK_GATHER_MS));
+            int n = uart_read_bytes(self->uart_num, buf, sizeof(buf), 0);
             if (n <= 0) {
                 break;
             }
             sink(ctx, buf, n);
-            if (n < (int)sizeof(buf)) {
-                break;          // the ring emptied: the bytes behind bring their own events
-            }
         }
     }
     xSemaphoreGive(self->c_sink_lock);
