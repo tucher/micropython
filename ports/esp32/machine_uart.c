@@ -62,6 +62,15 @@
 #define RXIDLE_TIMER_MIN (500) // 500us minimum rxidle time
 #define UART_QUEUE_SIZE (3)
 
+// The driver's default RX FIFO full threshold, which it sets at install but
+// does not export (UART_FULL_THRESH_DEFAULT and LP_UART_FULL_THRESH_DEFAULT
+// in esp_driver_uart/src/uart.c).
+#if SOC_UART_LP_NUM >= 1
+#define UART_RX_FULL_THRESH_DEFAULT(uart_num) ((uart_num) < SOC_UART_HP_NUM ? 120 : 10)
+#else
+#define UART_RX_FULL_THRESH_DEFAULT(uart_num) (120)
+#endif
+
 typedef struct _machine_uart_default_pins_t {
     gpio_num_t tx;
     gpio_num_t rx;
@@ -502,6 +511,9 @@ static void mp_machine_uart_init_helper(machine_uart_obj_t *self, size_t n_args,
         check_esp_err(uart_set_rx_full_threshold(self->uart_num, 1));
         check_esp_err(uart_set_rx_timeout(self->uart_num, 1));
     } else {
+        // Put back the threshold an earlier timeout_char of 0 may have
+        // lowered to one byte: only reinstalling the driver resets it.
+        check_esp_err(uart_set_rx_full_threshold(self->uart_num, UART_RX_FULL_THRESH_DEFAULT(self->uart_num)));
         check_esp_err(uart_set_rx_timeout(self->uart_num, rx_timeout));
     }
 
