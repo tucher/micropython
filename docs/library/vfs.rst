@@ -94,6 +94,9 @@ Filesystem Types
     transparently to existing files once they are opened for writing.  When *mtime*
     is enabled `os.stat` on files without timestamps will return 0 for the timestamp.
 
+    The default *readsize* is 32 unless the port or board sets another; the
+    read cache is four times *readsize*, at most a block.
+
     See :ref:`filesystem` for more information.
 
     .. staticmethod:: mkfs(block_dev, readsize=32, progsize=32, lookahead=32)
