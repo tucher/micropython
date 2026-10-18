@@ -222,6 +222,9 @@ static void socket_slice_reset(socket_obj_t *sock) {
 // is left of the caller's timeout. Without the second half the final slice
 // overshoots by up to a whole period, which is why a 250 ms timeout used to
 // fire at 301 ms.
+//
+// Never less than a millisecond: lwIP keeps SO_RCVTIMEO and SO_SNDTIMEO in
+// whole milliseconds, and reads zero as "wait for ever".
 static uint64_t socket_slice_us(socket_obj_t *sock, mp_uint_t start_ticks) {
     uint64_t slice_us = SOCKET_POLL_US;
     if (sock->timeout_ms == 0 || sock->timeout_ms == UINT64_MAX) {
@@ -229,10 +232,13 @@ static uint64_t socket_slice_us(socket_obj_t *sock, mp_uint_t start_ticks) {
     }
     uint64_t elapsed = (uint64_t)(mp_hal_ticks_ms() - start_ticks);
     if (elapsed >= sock->timeout_ms) {
-        return 1;           // deadline is up; the loop is about to say so
+        // The deadline passed since the caller last looked, as when a pending
+        // callback ran longer than what was left: one more short wait, and
+        // the loop says so.
+        return 1000;
     }
     uint64_t remain_us = (sock->timeout_ms - elapsed) * 1000;
-    return remain_us < slice_us ? (remain_us ? remain_us : 1) : slice_us;
+    return remain_us < slice_us ? remain_us : slice_us;
 }
 
 // For the loops that wait inside lwIP via SO_RCVTIMEO. connect() does not use
