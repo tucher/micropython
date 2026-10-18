@@ -47,13 +47,15 @@ async def tcp_client(message):
     client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     client_ctx.verify_mode = ssl.CERT_REQUIRED
     client_ctx.load_verify_locations(cafile=cafile)
-    reader, writer = await asyncio.open_connection(
-        IP,
-        PORT,
-        ssl=client_ctx,
-        server_hostname="foobar.local",  # incorrect server_hostname
-    )
     try:
+        # The handshake is done by open_connection(), so the certificate's
+        # refusal comes out of it.
+        reader, writer = await asyncio.open_connection(
+            IP,
+            PORT,
+            ssl=client_ctx,
+            server_hostname="foobar.local",  # incorrect server_hostname
+        )
         print("write:", message)
         writer.write(message)
         print("drain")
