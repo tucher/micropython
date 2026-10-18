@@ -16,16 +16,18 @@ from . import core
 # "from asyncio import StreamReader" into an ImportError there.
 _socket = None
 _EINPROGRESS = None
+_EAGAIN = None
 
 
 def _net():
-    global _socket, _EINPROGRESS
+    global _socket, _EINPROGRESS, _EAGAIN
     if _socket is None:
         import socket
-        from errno import EINPROGRESS
+        from errno import EINPROGRESS, EAGAIN
 
         _socket = socket
         _EINPROGRESS = EINPROGRESS
+        _EAGAIN = EAGAIN
     return _socket, _EINPROGRESS
 
 
@@ -141,8 +143,21 @@ def open_connection(host, port, ssl=None, server_hostname=None):
             server_hostname = host
         s = ssl.wrap_socket(s, server_hostname=server_hostname, do_handshake_on_connect=False)
         s.setblocking(False)
-    ss = Stream(s)
     yield core._io_queue.queue_write(s)
+    # Complete a TLS handshake here, as CPython does, without blocking the
+    # loop: a certificate the context refuses is refused by this call, not by
+    # the first write. A TLS module without do_handshake() leaves it to the
+    # first read or write, as before.
+    handshake = getattr(s, "do_handshake", None) if ssl else None
+    while handshake:
+        try:
+            handshake()
+            break
+        except OSError as er:
+            if er.errno != _EAGAIN:
+                raise er
+        yield core._io_queue.queue_write(s)
+    ss = Stream(s)
     return ss, ss
 
 
