@@ -524,11 +524,17 @@ static mp_obj_t network_ppp_connect(size_t n_args, const mp_obj_t *args, mp_map_
 
     ppp_set_usepeerdns(self->pcb, true);
 
+    // CONNECTING before the call, not after: once pppapi_connect() has
+    // returned the negotiation is the tcpip thread's, and its status callback
+    // may set CONNECTED (or ERROR) before this thread runs again. Written
+    // after, it would overwrite that, and isconnected() would stay false on
+    // a link that is up.
+    network_ppp_state_t was = self->state;
+    self->state = STATE_CONNECTING;
     if (pppapi_connect(self->pcb, 0) != ERR_OK) {
+        self->state = was;
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("ppp_connect failed"));
     }
-
-    self->state = STATE_CONNECTING;
 
     if (!self->c_sink_installed) {
         // Do a poll in case there is data waiting on the input stream.
