@@ -1278,6 +1278,14 @@ typedef time_t mp_timestamp_t;
 #define MICROPY_VFS_LFS2 (0)
 #endif
 
+// Read size, in bytes, of a littlefs filesystem made or mounted without one
+// -- by vfs.mount(bdev, path), for one. Its read cache is four times this, at
+// most a block, and a small cache makes directory compaction re-read the
+// flash in many small pieces.
+#ifndef MICROPY_VFS_LFS_READSIZE_DEFAULT
+#define MICROPY_VFS_LFS_READSIZE_DEFAULT (32)
+#endif
+
 // Support for ROMFS.
 #ifndef MICROPY_VFS_ROM
 #define MICROPY_VFS_ROM (0)
