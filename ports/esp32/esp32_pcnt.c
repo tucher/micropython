@@ -44,6 +44,7 @@ typedef struct _esp32_pcnt_irq_obj_t {
     mp_irq_obj_t base;
     uint32_t flags;
     uint32_t trigger;
+    uint32_t flags_taken;   // how many times irq.flags() has taken them
 } esp32_pcnt_irq_obj_t;
 
 typedef struct _esp32_pcnt_obj_t {
@@ -349,13 +350,19 @@ static mp_obj_t esp32_pcnt_value(size_t n_args, const mp_obj_t *pos_args) {
     // This loop ensures that the caller's state (as inferred from IRQs, e.g.
     // under/overflow) corresponds to the returned value, by synchronously
     // flushing all pending IRQs.
+    // The handler is expected to take the flags with irq.flags(). One that
+    // does not leaves them set, and calling it again would change nothing:
+    // stop then rather than spin. Flags it leaves are delivered with the next
+    // event, as when value() is not called at all.
     int16_t value;
     while (true) {
         check_esp_err(pcnt_get_counter_value(self->unit, &value));
         if (self->irq && self->irq->flags && self->irq->base.handler != mp_const_none) {
-            // The handler must call irq.flags() to clear self->irq->base.flags,
-            // otherwise this will be an infinite loop.
+            uint32_t taken = self->irq->flags_taken;
             mp_call_function_1(self->irq->base.handler, self->irq->base.parent);
+            if (self->irq->flags_taken == taken) {
+                break;
+            }
         } else {
             break;
         }
@@ -392,6 +399,7 @@ static mp_uint_t esp32_pcnt_irq_info(mp_obj_t self_in, mp_uint_t info_type) {
         mp_uint_t flags = self->irq->flags;
         self->irq->flags = 0;
         MICROPY_END_ATOMIC_SECTION(atomic_state);
+        self->irq->flags_taken++;
         return flags;
     } else if (info_type == MP_IRQ_INFO_TRIGGERS) {
         return self->irq->trigger;
@@ -435,6 +443,7 @@ static mp_obj_t esp32_pcnt_irq(size_t n_pos_args, const mp_obj_t *pos_args, mp_m
         self->irq->base.ishard = false;
         self->irq->base.handler = mp_const_none;
         self->irq->trigger = 0;
+        self->irq->flags_taken = 0;
     }
 
     if (n_pos_args > 1 || kw_args->used != 0) {
