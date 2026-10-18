@@ -229,7 +229,7 @@ The following methods are not part of the core Pin API and only implemented on c
    Get or set the pin pull state.
    See the constructor documentation for details of the ``pull`` argument.
 
-   Availability: cc3200, psoc-edge, stm32 ports.
+   Availability: cc3200, esp32 (ESP-IDF 5.5 and later), psoc-edge, stm32 ports.
 
 .. method:: Pin.drive([drive])
 
