@@ -31,6 +31,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_task.h"
 #include "shared/runtime/mpirq.h"
 
@@ -132,9 +133,13 @@ typedef struct _machine_uart_obj_t {
     // Optional C-level consumer of incoming data (MP_STREAM_SET_DATA_SINK).
     // When set, uart_event_task hands bytes straight to it and skips the
     // RXIDLE timer and the Python IRQ entirely.
+    // c_sink and c_sink_ctx change, and are read, only under c_sink_lock,
+    // which uart_event_task holds for as long as it calls the sink: once
+    // detaching has taken the lock, no callback is running or can start.
     mp_stream_data_sink_t c_sink;
     void *c_sink_ctx;
-    volatile bool c_sink_running;   // set while inside the callback
+    SemaphoreHandle_t c_sink_lock;
+    volatile bool c_sink_detaching; // asks a drain in progress to stop early
     volatile uint32_t rx_overrun;   // FIFO overflows + ring-buffer-full events
     volatile uint32_t tx_congested; // writes refused because the TX ring was full
     volatile uint16_t tx_max_write;  // largest single write the C writer was asked for
@@ -186,6 +191,37 @@ static bool uart_timer_callback(machine_timer_obj_t *timer) {
 // a buffer's worth of line time, and nothing next to PPP's own timers.
 #define UART_SINK_GATHER_MS (5)
 
+// Hand what the driver holds to the C sink, if one is attached; false if
+// none is. Under c_sink_lock, so a detach waits for this to finish.
+//
+// A buffer at a time, waiting a moment for it to fill: the modem hands a
+// burst over a few bytes at a time, and taking each few as it came was an
+// interrupt, a read, a pbuf and a message to lwIP for each -- in thousands,
+// at this task's priority on the VM's core. A TLS server's answer over PPP
+// took the VM off its core for most of half a second. Blocked in the wait,
+// this task leaves the core to the VM; the bytes keep arriving in the
+// driver's ring meanwhile.
+static bool uart_sink_drain(machine_uart_obj_t *self) {
+    xSemaphoreTake(self->c_sink_lock, portMAX_DELAY);
+    mp_stream_data_sink_t sink = self->c_sink;
+    void *ctx = self->c_sink_ctx;
+    if (sink != NULL) {
+        uint8_t buf[256];
+        while (!self->c_sink_detaching) {
+            int n = uart_read_bytes(self->uart_num, buf, sizeof(buf), pdMS_TO_TICKS(UART_SINK_GATHER_MS));
+            if (n <= 0) {
+                break;
+            }
+            sink(ctx, buf, n);
+            if (n < (int)sizeof(buf)) {
+                break;          // the ring emptied: the bytes behind bring their own events
+            }
+        }
+    }
+    xSemaphoreGive(self->c_sink_lock);
+    return sink != NULL;
+}
+
 static void uart_event_task(void *self_in) {
     machine_uart_obj_t *self = MP_OBJ_TO_PTR(self_in);
     uart_event_t event;
@@ -196,34 +232,7 @@ static void uart_event_task(void *self_in) {
             switch (event.type) {
                 // Event of UART receiving data
                 case UART_DATA:
-                    if (self->c_sink != NULL) {
-                        // C consumer: drain the driver here and now. No timer,
-                        // no scheduler, no dependency on the VM making progress.
-                        //
-                        // A buffer at a time, waiting a moment for it to fill:
-                        // the modem hands a burst over a few bytes at a time,
-                        // and taking each few as it came was an interrupt, a
-                        // read, a pbuf and a message to lwIP for each -- in
-                        // thousands, at this task's priority on the VM's core.
-                        // A TLS server's answer over PPP took the VM off its
-                        // core for most of half a second. Blocked in the wait,
-                        // this task leaves the core to the VM; the bytes keep
-                        // arriving in the driver's ring meanwhile.
-                        uint8_t buf[256];
-                        self->c_sink_running = true;
-                        mp_stream_data_sink_t sink = self->c_sink;
-                        while (sink != NULL) {
-                            int n = uart_read_bytes(self->uart_num, buf, sizeof(buf), pdMS_TO_TICKS(UART_SINK_GATHER_MS));
-                            if (n <= 0) {
-                                break;
-                            }
-                            sink(self->c_sink_ctx, buf, n);
-                            if (n < (int)sizeof(buf)) {
-                                break;          // the ring emptied: the bytes behind bring their own events
-                            }
-                            sink = self->c_sink;
-                        }
-                        self->c_sink_running = false;
+                    if (self->c_sink_lock != NULL && uart_sink_drain(self)) {
                         break;
                     }
                     if (self->mp_irq_trigger & UART_IRQ_RXIDLE) {
@@ -557,7 +566,8 @@ static mp_obj_t mp_machine_uart_make_new(const mp_obj_type_t *type, size_t n_arg
         self->uart_num = uart_num;
         self->c_sink = NULL;
         self->c_sink_ctx = NULL;
-        self->c_sink_running = false;
+        self->c_sink_lock = NULL;
+        self->c_sink_detaching = false;
         self->rx_overrun = 0;
         self->tx_congested = 0;
         self->tx_max_write = 0;
@@ -578,8 +588,16 @@ static mp_obj_t mp_machine_uart_make_new(const mp_obj_type_t *type, size_t n_arg
 
 static void mp_machine_uart_deinit(machine_uart_obj_t *self) {
     if (self->uart_event_task != NULL) {
+        // Not while it calls the sink: deleted holding c_sink_lock, the task
+        // would never give it back.
+        if (self->c_sink_lock != NULL) {
+            xSemaphoreTake(self->c_sink_lock, portMAX_DELAY);
+        }
         vTaskDelete(self->uart_event_task);
         self->uart_event_task = NULL;
+        if (self->c_sink_lock != NULL) {
+            xSemaphoreGive(self->c_sink_lock);
+        }
     }
     if (self->rxidle_timer != NULL) {
         machine_timer_stop(self->rxidle_timer);
@@ -603,6 +621,10 @@ void machine_uart_deinit_all(void) {
         machine_uart_obj_t *uart = MP_STATE_PORT(machine_uart_objs)[i];
         if (uart) {
             mp_machine_uart_deinit(uart);
+            if (uart->c_sink_lock != NULL) {
+                vSemaphoreDelete(uart->c_sink_lock);
+                uart->c_sink_lock = NULL;
+            }
             MP_STATE_PORT(machine_uart_objs)[i] = NULL;
         }
     }
@@ -851,19 +873,33 @@ static mp_uint_t mp_machine_uart_ioctl(mp_obj_t self_in, mp_uint_t request, uint
     } else if (request == MP_STREAM_SET_DATA_SINK) {
         mp_stream_data_sink_cfg_t *cfg = (mp_stream_data_sink_cfg_t *)arg;
         if (cfg->handler == NULL) {
-            self->c_sink = NULL;
-            // Wait for an in-flight callback to finish before the caller frees
-            // anything the sink context points at.
-            for (int i = 0; i < 100 && self->c_sink_running; ++i) {
-                vTaskDelay(1);
+            // Taking the lock waits out a callback in progress: once this
+            // returns, the caller may free what the context points at. The
+            // flag ends a drain at its next buffer, so a steady stream does
+            // not keep the detach waiting.
+            if (self->c_sink_lock != NULL) {
+                self->c_sink_detaching = true;
+                xSemaphoreTake(self->c_sink_lock, portMAX_DELAY);
+                self->c_sink = NULL;
+                self->c_sink_ctx = NULL;
+                self->c_sink_detaching = false;
+                xSemaphoreGive(self->c_sink_lock);
             }
-            self->c_sink_ctx = NULL;
         } else {
+            if (self->c_sink_lock == NULL) {
+                self->c_sink_lock = xSemaphoreCreateMutex();
+                if (self->c_sink_lock == NULL) {
+                    *errcode = MP_ENOMEM;
+                    return MP_STREAM_ERROR;
+                }
+            }
             if (self->uart_event_task == NULL) {
                 uart_event_task_create(self);
             }
+            xSemaphoreTake(self->c_sink_lock, portMAX_DELAY);
             self->c_sink_ctx = cfg->ctx;
             self->c_sink = cfg->handler;
+            xSemaphoreGive(self->c_sink_lock);
         }
         ret = 0;
     } else if (request == MP_STREAM_GET_C_WRITER) {
