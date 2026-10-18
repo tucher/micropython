@@ -160,6 +160,23 @@ static void machine_pin_print(const mp_print_t *print, mp_obj_t self_in, mp_prin
     mp_printf(print, ")");
 }
 
+static void machine_pin_set_pull(gpio_num_t index, mp_obj_t pull) {
+    int mode = 0;
+    if (pull != mp_const_none) {
+        mode = mp_obj_get_int(pull);
+    }
+    if (mode & GPIO_PULL_DOWN) {
+        gpio_pulldown_en(index);
+    } else {
+        gpio_pulldown_dis(index);
+    }
+    if (mode & GPIO_PULL_UP) {
+        gpio_pullup_en(index);
+    } else {
+        gpio_pullup_dis(index);
+    }
+}
+
 // pin.init(mode=None, pull=-1, *, value, drive, hold)
 static mp_obj_t machine_pin_obj_init_helper(const machine_pin_obj_t *self, size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_mode, ARG_pull, ARG_value, ARG_drive, ARG_hold };
@@ -236,20 +253,7 @@ static mp_obj_t machine_pin_obj_init_helper(const machine_pin_obj_t *self, size_
 
     // configure pull
     if (args[ARG_pull].u_obj != MP_OBJ_NEW_SMALL_INT(-1)) {
-        int mode = 0;
-        if (args[ARG_pull].u_obj != mp_const_none) {
-            mode = mp_obj_get_int(args[ARG_pull].u_obj);
-        }
-        if (mode & GPIO_PULL_DOWN) {
-            gpio_pulldown_en(index);
-        } else {
-            gpio_pulldown_dis(index);
-        }
-        if (mode & GPIO_PULL_UP) {
-            gpio_pullup_en(index);
-        } else {
-            gpio_pullup_dis(index);
-        }
+        machine_pin_set_pull(index, args[ARG_pull].u_obj);
     }
 
     // configure pad hold
@@ -333,6 +337,24 @@ static mp_obj_t machine_pin_toggle(mp_obj_t self_in) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(machine_pin_toggle_obj, machine_pin_toggle);
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+// pin.pull([pull])
+static mp_obj_t machine_pin_pull(size_t n_args, const mp_obj_t *args) {
+    machine_pin_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    gpio_num_t index = PIN_OBJ_PTR_INDEX(self);
+    if (n_args > 1) {
+        machine_pin_set_pull(index, args[1]);
+        return mp_const_none;
+    }
+    // Read back from the pad, so that what a peripheral driver set is seen too.
+    gpio_io_config_t gpio_io_config;
+    gpio_get_io_config(index, &gpio_io_config);
+    int pull = (gpio_io_config.pu ? GPIO_PULL_UP : 0) | (gpio_io_config.pd ? GPIO_PULL_DOWN : 0);
+    return pull ? MP_OBJ_NEW_SMALL_INT(pull) : mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(machine_pin_pull_obj, 1, 2, machine_pin_pull);
+#endif
 
 // pin.irq(handler=None, trigger=IRQ_FALLING|IRQ_RISING)
 static mp_obj_t machine_pin_irq(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
@@ -420,6 +442,9 @@ static const mp_rom_map_elem_t machine_pin_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_off), MP_ROM_PTR(&machine_pin_off_obj) },
     { MP_ROM_QSTR(MP_QSTR_on), MP_ROM_PTR(&machine_pin_on_obj) },
     { MP_ROM_QSTR(MP_QSTR_toggle), MP_ROM_PTR(&machine_pin_toggle_obj) },
+    #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    { MP_ROM_QSTR(MP_QSTR_pull), MP_ROM_PTR(&machine_pin_pull_obj) },
+    #endif
     { MP_ROM_QSTR(MP_QSTR_irq), MP_ROM_PTR(&machine_pin_irq_obj) },
 
     // class attributes
