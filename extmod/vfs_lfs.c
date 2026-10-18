@@ -37,7 +37,7 @@ enum { LFS_MAKE_ARG_bdev, LFS_MAKE_ARG_readsize, LFS_MAKE_ARG_progsize, LFS_MAKE
 
 static const mp_arg_t lfs_make_allowed_args[] = {
     { MP_QSTR_, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
-    { MP_QSTR_readsize, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 32} },
+    { MP_QSTR_readsize, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = MICROPY_VFS_LFS_READSIZE_DEFAULT} },
     { MP_QSTR_progsize, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 32} },
     { MP_QSTR_lookahead, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 32} },
     { MP_QSTR_mtime, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true} },
