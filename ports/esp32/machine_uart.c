@@ -900,6 +900,14 @@ static mp_uint_t mp_machine_uart_ioctl(mp_obj_t self_in, mp_uint_t request, uint
             self->c_sink_ctx = cfg->ctx;
             self->c_sink = cfg->handler;
             xSemaphoreGive(self->c_sink_lock);
+            // Bytes that came while no sink was attached raised their events
+            // then, and went to no one. Without an event of their own they
+            // would wait in the ring until the next byte arrived.
+            size_t pending = 0;
+            if (uart_get_buffered_data_len(self->uart_num, &pending) == ESP_OK && pending > 0) {
+                uart_event_t event = { .type = UART_DATA, .size = pending };
+                xQueueSend(self->uart_queue, &event, 0);
+            }
         }
         ret = 0;
     } else if (request == MP_STREAM_GET_C_WRITER) {
