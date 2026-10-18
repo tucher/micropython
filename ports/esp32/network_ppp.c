@@ -38,6 +38,7 @@
 #if defined(CONFIG_ESP_NETIF_TCPIP_LWIP) && defined(CONFIG_LWIP_PPP_SUPPORT)
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "lwip/dns.h"
@@ -151,7 +152,7 @@ static void network_ppp_reap(void) {
 
 const mp_obj_type_t esp_network_ppp_lwip_type;
 
-static void network_ppp_teardown(network_ppp_obj_t *self, bool shutdown);
+static bool network_ppp_teardown(network_ppp_obj_t *self, bool shutdown);
 
 // Receive path when the stream supports a C sink. Runs on the stream's own
 // task (for machine.UART: uart_event_task), never on the MicroPython thread, so
@@ -655,39 +656,37 @@ static mp_obj_t network_ppp_active(size_t n_args, const mp_obj_t *args) {
                 return mp_const_false;
             }
 
-            network_ppp___del__(MP_OBJ_FROM_PTR(self));
+            bool freed = network_ppp_teardown(self, false);
             network_ppp_reap();
+            if (!freed) {
+                mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("pppapi_free failed"));
+            }
         }
     }
     return mp_obj_new_bool(self->state >= STATE_ACTIVE);
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(network_ppp_active_obj, 1, 2, network_ppp_active);
 
-// Tear one session down far enough that lwIP no longer references memory owned
-// by the MicroPython heap. Must not raise: it runs from the soft-reset path,
-// outside any nlr handler.
 // The tcpip mailbox is FIFO, so once a message posted here has been processed,
-// everything the sink queued ahead of it has been too. The sequence number
-// makes a timed-out barrier harmless: its late callback publishes a number no
-// later wait is looking for. Only ever used from the MicroPython thread.
-static volatile uint32_t network_ppp_barrier_seq;
-static volatile uint32_t network_ppp_barrier_done;
+// everything the sink queued ahead of it has been too. tcpip_callback() waits
+// for room in the mailbox and fails only when no message can be allocated:
+// then it is tried again, not skipped. Only ever used from the MicroPython
+// thread.
+static StaticSemaphore_t network_ppp_barrier_buf;
+static SemaphoreHandle_t network_ppp_barrier;
 
 static void network_ppp_barrier_cb(void *ctx) {
-    network_ppp_barrier_done = (uint32_t)(uintptr_t)ctx;
+    xSemaphoreGive((SemaphoreHandle_t)ctx);
 }
 
 static void network_ppp_drain_tcpip(void) {
-    uint32_t seq = ++network_ppp_barrier_seq;
-    if (tcpip_callback(network_ppp_barrier_cb, (void *)(uintptr_t)seq) != ERR_OK) {
-        // Could not post. Pausing is a poor substitute for the barrier, but it
-        // beats freeing immediately behind input that may still be queued.
-        vTaskDelay(pdMS_TO_TICKS(50));
-        return;
+    if (network_ppp_barrier == NULL) {
+        network_ppp_barrier = xSemaphoreCreateBinaryStatic(&network_ppp_barrier_buf);
     }
-    for (int i = 0; i < 200 && network_ppp_barrier_done != seq; ++i) {
-        vTaskDelay(pdMS_TO_TICKS(5));
+    while (tcpip_callback(network_ppp_barrier_cb, network_ppp_barrier) != ERR_OK) {
+        vTaskDelay(1);
     }
+    xSemaphoreTake(network_ppp_barrier, portMAX_DELAY);
 }
 
 // The one place a pcb is freed. Runs on the MicroPython thread, where blocking
@@ -700,8 +699,8 @@ static void network_ppp_drain_tcpip(void) {
 //
 // `shutdown` is for the soft-reset path, which must also stop the output
 // callback reaching a VM that is being torn down. Must not raise: it is called
-// from outside any nlr handler.
-static void network_ppp_teardown(network_ppp_obj_t *self, bool shutdown) {
+// from outside any nlr handler. Returns false if lwIP would not free the pcb.
+static bool network_ppp_teardown(network_ppp_obj_t *self, bool shutdown) {
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
         network_ppp_stream_uart_irq_disable(self);
@@ -713,35 +712,40 @@ static void network_ppp_teardown(network_ppp_obj_t *self, bool shutdown) {
 
     if (self->pcb == NULL) {
         self->state = STATE_INACTIVE;
-        return;
+        return true;
     }
 
     if (self->state >= STATE_ERROR && !self->pcb_dead) {
-        // nocarrier=1: do not wait for the peer. The status callback marks the
-        // session dead; it does not free it.
+        // nocarrier=1: no shutdown procedure, the link is dead when this
+        // returns. The status callback marks it so; it does not free it. An
+        // lwIP that honours nocarrier in the running phase only goes through
+        // LCP's terminate exchange from any other, and the session is dead
+        // once that has run out: no later than its own settings say.
         pppapi_close(self->pcb, 1);
-        for (int i = 0; i < 200 && !self->pcb_dead; ++i) {
+        const ppp_settings *settings = &self->pcb->settings;
+        uint32_t wait_ms = 1000 * settings->fsm_timeout_time * (settings->fsm_max_term_transmits + 1);
+        for (uint32_t t = 0; !self->pcb_dead && t < wait_ms; t += 5) {
             vTaskDelay(pdMS_TO_TICKS(5));
         }
     }
 
     network_ppp_drain_tcpip();
 
-    if (pppapi_free(self->pcb) == ERR_OK) {
+    bool freed = pppapi_free(self->pcb) == ERR_OK;
+    if (freed) {
         self->pcb = NULL;
     } else {
-        // Wedged. Leaking the pcb is survivable; leaving a netif that points
-        // into the MicroPython heap in lwIP's global list is not.
+        // lwIP keeps the pcb, and its timers. The netif must still leave
+        // lwIP's list: it lives in the MicroPython heap. The pcb stays on
+        // the root list with its object, which its callbacks point at.
         netifapi_netif_remove(&self->netif);
-        #if NETWORK_PPP_DEINIT_TRACE
-        mp_printf(&mp_plat_print, "[ppp] teardown: forced netif_remove\n");
-        #endif
     }
     #if NETWORK_PPP_DEINIT_TRACE
     mp_printf(&mp_plat_print, "[ppp] teardown: pcb=%p state=%d\n", self->pcb, self->state);
     #endif
     self->pcb_dead = false;
     self->state = STATE_INACTIVE;
+    return freed;
 }
 
 // Called from the soft-reset path, BEFORE machine_uart_deinit_all(): detaching
@@ -760,7 +764,9 @@ void network_ppp_deinit_all(void) {
         network_ppp_obj_t *next = self->next;
         self->next = NULL;
         self->listed = false;
-        network_ppp_teardown(self, true);
+        if (!network_ppp_teardown(self, true)) {
+            mp_printf(&mp_plat_print, "Warning: a PPP session was not freed\n");
+        }
         self = next;
     }
 }
