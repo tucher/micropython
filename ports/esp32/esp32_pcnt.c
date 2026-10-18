@@ -34,6 +34,7 @@
 #include "shared/runtime/mpirq.h"
 
 #include "modesp32.h"
+#include "driver/gpio.h"
 #include "driver/pcnt.h"
 
 #if !MICROPY_ENABLE_FINALISER
@@ -70,6 +71,21 @@ void esp32_pcnt_deinit_all(void) {
         *pcnt = (*pcnt)->next;
     }
 }
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+static void esp32_pcnt_restore_pull(gpio_num_t pin, const gpio_io_config_t *cfg) {
+    if (cfg->pu) {
+        gpio_pullup_en(pin);
+    } else {
+        gpio_pullup_dis(pin);
+    }
+    if (cfg->pd) {
+        gpio_pulldown_en(pin);
+    } else {
+        gpio_pulldown_dis(pin);
+    }
+}
+#endif
 
 static void esp32_pcnt_init_helper(esp32_pcnt_obj_t *self, size_t n_pos_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum {
@@ -134,7 +150,27 @@ static void esp32_pcnt_init_helper(esp32_pcnt_obj_t *self, size_t n_pos_args, co
             mode_pin = mp_hal_get_pin_obj(args[ARG_mode_pin].u_obj);
         }
 
+        #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+        // The driver turns a pull-up on and the pull-down off on both pins,
+        // whatever the Pin was set to: put back what the user configured,
+        // since a pull-up holds a pulled-down input high and nothing counts.
+        gpio_io_config_t pin_cfg, mode_pin_cfg;
+        if (pin != PCNT_PIN_NOT_USED) {
+            gpio_get_io_config(pin, &pin_cfg);
+        }
+        if (mode_pin != PCNT_PIN_NOT_USED) {
+            gpio_get_io_config(mode_pin, &mode_pin_cfg);
+        }
         pcnt_set_pin(self->unit, channel, pin, mode_pin);
+        if (pin != PCNT_PIN_NOT_USED) {
+            esp32_pcnt_restore_pull(pin, &pin_cfg);
+        }
+        if (mode_pin != PCNT_PIN_NOT_USED) {
+            esp32_pcnt_restore_pull(mode_pin, &mode_pin_cfg);
+        }
+        #else
+        pcnt_set_pin(self->unit, channel, pin, mode_pin);
+        #endif
     }
 
     if (
