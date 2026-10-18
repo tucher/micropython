@@ -95,12 +95,13 @@ int vprintf_null(const char *format, va_list ap) {
 
 #if MICROPY_SSL_MBEDTLS
 static time_t platform_mbedtls_time(time_t *timer) {
-    // mbedtls_time requires time in seconds from EPOCH 1970
+    // mbedtls_time requires time in seconds from EPOCH 1970; the clock counts
+    // from MicroPython's epoch, which a board may set to 1970.
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
 
-    return tv.tv_sec + TIMEUTILS_SECONDS_1970_TO_2000;
+    return timeutils_seconds_since_epoch_to_nanoseconds_since_1970(tv.tv_sec) / 1000000000LL;
 }
 #endif
 
