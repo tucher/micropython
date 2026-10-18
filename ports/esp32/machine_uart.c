@@ -421,7 +421,9 @@ static void mp_machine_uart_init_helper(machine_uart_obj_t *self, size_t n_args,
         // 3. Python code called .deinit() and now .init()
         check_esp_err(uart_param_config(self->uart_num, &uartcfg));
         check_esp_err(uart_driver_install(self->uart_num, self->rxbuf, self->txbuf, UART_QUEUE_SIZE, &self->uart_queue, 0));
-        if (self->mp_irq_obj != NULL && self->mp_irq_obj->handler != mp_const_none) {
+        // The event task serves Python's irq() and the C sink alike: either
+        // set up before the driver went comes back with it.
+        if ((self->mp_irq_obj != NULL && self->mp_irq_obj->handler != mp_const_none) || self->c_sink != NULL) {
             uart_event_task_create(self);
         }
         // A C writer handed out before a deinit() -- one of its own, or one
