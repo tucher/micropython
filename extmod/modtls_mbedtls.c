@@ -991,6 +991,46 @@ static mp_uint_t socket_write(mp_obj_t o_in, const void *buf, mp_uint_t size, in
     return MP_STREAM_ERROR;
 }
 
+// SSLSocket.do_handshake(), as CPython's: drive the handshake of a socket
+// wrapped with do_handshake_on_connect=False. On a non-blocking socket it
+// raises OSError(EAGAIN) while it waits -- for the peer, or, with
+// restartable ECC, to compute its next piece -- and polling the socket says
+// when to call it again. Returns None once the handshake is over.
+static mp_obj_t socket_do_handshake(mp_obj_t self_in) {
+    mp_obj_ssl_socket_t *o = MP_OBJ_TO_PTR(self_in);
+    o->poll_mask = 0;
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    o->computing = false;
+    #endif
+    if (o->sock == MP_OBJ_NULL) {
+        mp_raise_OSError(MP_EBADF);
+    }
+    if (o->last_error) {
+        mbedtls_raise_error(o->last_error);
+    }
+
+    store_active_context(o->ssl_context);
+    int ret = mbedtls_ssl_handshake(&o->ssl);
+    if (ret == 0) {
+        return mp_const_none;
+    }
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+        o->poll_mask = MP_STREAM_POLL_RD;
+    } else if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        o->poll_mask = MP_STREAM_POLL_WR;
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    } else if (ret == MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS) {
+        o->computing = true;
+    #endif
+    } else {
+        o->last_error = ret;
+        ssl_check_async_handshake_failure(o, &ret);
+        mbedtls_raise_error(ret);
+    }
+    mp_raise_OSError(MP_EAGAIN);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(socket_do_handshake_obj, socket_do_handshake);
+
 static mp_obj_t socket_setblocking(mp_obj_t self_in, mp_obj_t flag_in) {
     mp_obj_ssl_socket_t *o = MP_OBJ_TO_PTR(self_in);
     mp_obj_t sock = o->sock;
@@ -1088,6 +1128,7 @@ static const mp_rom_map_elem_t ssl_socket_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_sendall), MP_ROM_PTR(&mp_stream_write_obj) },
     #endif
     { MP_ROM_QSTR(MP_QSTR_setblocking), MP_ROM_PTR(&socket_setblocking_obj) },
+    { MP_ROM_QSTR(MP_QSTR_do_handshake), MP_ROM_PTR(&socket_do_handshake_obj) },
     { MP_ROM_QSTR(MP_QSTR_close), MP_ROM_PTR(&mp_stream_close_obj) },
     #if MICROPY_PY_SSL_FINALISER
     { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&mp_stream_close_obj) },
