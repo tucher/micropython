@@ -1553,7 +1553,9 @@ mp_obj_t mp_import_from(mp_obj_t module, qstr name) {
 
     mp_obj_t dest[2];
 
-    mp_load_method_maybe(module, name, dest);
+    // A module's __getattr__ raises AttributeError for a name it does not
+    // have; to an import that name is missing, as in CPython.
+    mp_load_method_protected(module, name, dest, false);
     if (dest[1] != MP_OBJ_NULL) {
         // Importing a bound method from a class instance.
         return mp_obj_new_bound_meth(dest[0], dest[1]);
@@ -1565,7 +1567,7 @@ mp_obj_t mp_import_from(mp_obj_t module, qstr name) {
     #if MICROPY_ENABLE_EXTERNAL_IMPORT
 
     // See if it's a package, then can try FS import
-    mp_load_method_maybe(module, MP_QSTR___path__, dest);
+    mp_load_method_protected(module, MP_QSTR___path__, dest, false);
     if (dest[0] == MP_OBJ_NULL) {
         goto import_error;
     }
