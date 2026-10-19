@@ -3,31 +3,6 @@
 
 from . import core
 
-# Resolved on first use and kept, rather than imported per call.
-#
-# Per call is what open_connection() used to do, and it is expensive: importing
-# an extensible built-in searches sys.path before falling back to the built-in
-# and never caches the result, so on a board with a slow filesystem it costs
-# tens of milliseconds every time -- measured at 46 ms for these two on esp32.
-#
-# At module level is wrong too, though it was tried: this file is frozen on
-# ports that have no socket module at all -- samd, for one -- where it is still
-# used for StreamReader over a UART. An import at the top would turn
-# "from asyncio import StreamReader" into an ImportError there.
-_socket = None
-_EINPROGRESS = None
-
-
-def _net():
-    global _socket, _EINPROGRESS
-    if _socket is None:
-        import socket
-        from errno import EINPROGRESS
-
-        _socket = socket
-        _EINPROGRESS = EINPROGRESS
-    return _socket, _EINPROGRESS
-
 
 class Stream:
     def __init__(self, s, e={}):
@@ -128,7 +103,9 @@ StreamWriter = Stream
 #
 # async
 def open_connection(host, port, ssl=None, server_hostname=None):
-    socket, EINPROGRESS = _net()
+    from errno import EINPROGRESS
+    import socket
+
     ai = (yield from core.Loop.getaddrinfo(host, port, type=socket.SOCK_STREAM))[0]
     s = socket.socket(ai[0], ai[1], ai[2])
     s.setblocking(False)
@@ -206,7 +183,8 @@ class Server:
 # Helper function to start a TCP stream server, running as a new task
 # TODO could use an accept-callback on socket read activity instead of creating a task
 async def start_server(cb, host, port, backlog=5, ssl=None):
-    socket = _net()[0]
+    import socket
+
     # Create and bind server socket.
     addr_info = (await core.Loop.getaddrinfo(host, port))[0]
     s = socket.socket(addr_info[0])  # Use address family from getaddrinfo
