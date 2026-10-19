@@ -203,7 +203,7 @@ TCP stream connections
 .. function:: open_connection(host, port, ssl=None)
 
     Open a TCP connection to the given *host* and *port*.  The *host* address will be
-    resolved using `socket.getaddrinfo`, which is currently a blocking call.
+    resolved using `Loop.getaddrinfo`.
     If *ssl* is a `ssl.SSLContext` object, this context is used to create the transport;
     if *ssl* is ``True``, a default context is used.
 
@@ -342,6 +342,15 @@ Event Loop
 .. method:: Loop.close()
 
     Close the event loop.
+
+.. method:: Loop.getaddrinfo(host, port, *, family=0, type=0, proto=0, flags=0)
+
+    Resolve *host* and *port* as `socket.getaddrinfo` does.  On ports whose
+    ``socket`` module can start a lookup without waiting for it (currently esp32)
+    the event loop keeps running other tasks until the answer arrives; elsewhere
+    this calls `socket.getaddrinfo`, which blocks.
+
+    This is a coroutine.
 
 .. method:: Loop.set_exception_handler(handler)
 
