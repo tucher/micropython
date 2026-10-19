@@ -70,12 +70,11 @@
 // KeyboardInterrupt, a callback scheduled from an ISR by micropython.schedule(),
 // an exception scheduled from C.
 //
-// It was 100 ms, unnamed and unexplained, and it is the reason Ctrl-C out of a
-// blocked recv() used to take up to a tenth of a second. The measured cost of
-// the slice is small because a blocked socket sleeps inside lwIP rather than
-// spinning.
+// It is why Ctrl-C out of a blocked recv() can take up to a tenth of a second
+// at the default. A port or board may shorten it: the cost is small, because
+// a blocked socket sleeps inside lwIP rather than spinning.
 #ifndef MICROPY_PY_SOCKET_POLL_PERIOD_MS
-#define MICROPY_PY_SOCKET_POLL_PERIOD_MS (20)
+#define MICROPY_PY_SOCKET_POLL_PERIOD_MS (100)
 #endif
 #define SOCKET_POLL_US (MICROPY_PY_SOCKET_POLL_PERIOD_MS * 1000)
 #define MDNS_QUERY_TIMEOUT_MS (5000)
