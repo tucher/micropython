@@ -269,6 +269,11 @@ def _run_until_complete(main_task):
                 _exc_context["exception"] = exc
                 _exc_context["future"] = t
                 Loop.call_exception_handler(_exc_context)
+            else:
+                # Task is already finished and was await'ed on before it got here,
+                # so its exception has been retrieved.  Keep it for any later await,
+                # which must raise it again, rather than leave the task with no data.
+                t.data = exc
             # If it's the main task then the loop should stop
             if t is main_task:
                 return er.value
