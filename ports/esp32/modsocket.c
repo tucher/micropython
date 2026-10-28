@@ -1125,78 +1125,69 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(esp_socket_getaddrinfo_obj, 2, 6, esp
 // event loop can wait on it through select.poll() like any other stream.
 //
 // Lifetime is the delicate part. lwIP holds a pointer to the request for the
-// whole query and there is no way to cancel one, so the object has to outlive
-// a coroutine that gives up early -- asyncio.wait_for() being the obvious case.
-// It is therefore held on a GC root list until the answer (or the failure) is
-// in, exactly like the PPP session list in network_ppp.c. Putting this state on
-// the C stack, as extmod/modlwip.c does, is a use-after-free waiting to happen.
+// whole query and there is no way to cancel one, so the request must outlive a
+// coroutine that gives up early -- asyncio.wait_for() being the obvious case --
+// and a soft reset, which wipes the GC heap while lwIP still holds the pointer.
+// So what lwIP writes to lives in the C heap, not the GC heap, shared by two
+// owners: the query and the Python object. Each lets go once (the query when
+// the answer or the failure is in, the object when it is collected, which a
+// soft reset also does), and the last one frees it. Putting this state on the
+// C stack, as extmod/modlwip.c does, is a use-after-free waiting to happen; so
+// was keeping it in the GC heap on a root list, which a soft reset left
+// pointing into the next session's heap.
 
-typedef struct _getaddrinfo_req_t {
-    mp_obj_base_t base;
+typedef struct _getaddrinfo_state_t {
     // Written on the lwIP thread, read on the MicroPython thread. `status` is
     // published last, after `addr`, with a barrier in between.
     volatile int status;                // 0 pending, 1 resolved, <0 errno
     ip_addr_t addr;
-    // Set up before the request is handed over; read on the lwIP thread.
-    const char *name;
-    mp_obj_t host;                      // keeps `name`'s storage alive
+    uint8_t addrtype;
+    int refs;                           // owners left: the query, the object
+    char name[];                        // the host, for the lwIP thread
+} getaddrinfo_state_t;
+
+typedef struct _getaddrinfo_req_t {
+    mp_obj_base_t base;
+    getaddrinfo_state_t *st;
+    mp_obj_t host;                      // for canonname
     uint16_t port;
     uint8_t socktype;
     uint8_t proto;
-    uint8_t addrtype;
-    struct _getaddrinfo_req_t *next;
-    bool listed;
 } getaddrinfo_req_t;
 
 static const mp_obj_type_t getaddrinfo_req_type;
 
-static void getaddrinfo_req_unlist(getaddrinfo_req_t *req) {
-    getaddrinfo_req_t **link = &MP_STATE_PORT(socket_getaddrinfo_req_head);
-    while (*link != NULL) {
-        if (*link == req) {
-            *link = req->next;
-            req->next = NULL;
-            req->listed = false;
-            return;
-        }
-        link = &(*link)->next;
+static void getaddrinfo_state_release(getaddrinfo_state_t *st) {
+    if (__atomic_sub_fetch(&st->refs, 1, __ATOMIC_ACQ_REL) == 0) {
+        free(st);
     }
 }
 
-// Release requests whose answer has arrived but whose caller never collected it
-// (a cancelled coroutine). Only ever called from the MicroPython thread.
-static void getaddrinfo_req_reap(void) {
-    getaddrinfo_req_t **link = &MP_STATE_PORT(socket_getaddrinfo_req_head);
-    while (*link != NULL) {
-        getaddrinfo_req_t *req = *link;
-        if (req->status != 0) {
-            *link = req->next;
-            req->next = NULL;
-            req->listed = false;
-        } else {
-            link = &req->next;
-        }
-    }
+// The query's end: publish the answer, wake the event loop, let go.
+static void getaddrinfo_publish(getaddrinfo_state_t *st, int status) {
+    __sync_synchronize();
+    st->status = status;
+    mp_hal_wake_main_task();
+    getaddrinfo_state_release(st);
 }
 
 // Both callbacks below run on the lwIP tcpip thread. They must not touch the VM.
 static void getaddrinfo_found_cb(const char *name, const ip_addr_t *ipaddr, void *arg) {
-    getaddrinfo_req_t *req = arg;
+    getaddrinfo_state_t *st = arg;
     int status = -2; // name or service not known, as the blocking path reports it
     if (ipaddr != NULL) {
-        req->addr = *ipaddr;
+        st->addr = *ipaddr;
         status = 1;
     }
-    __sync_synchronize();
-    req->status = status;
+    getaddrinfo_publish(st, status);
 }
 
 // CONFIG_LWIP_TCPIP_CORE_LOCKING is off in this port, so the DNS API may only be
 // called from the tcpip thread itself. tcpip_callback() is how we get there.
 static void getaddrinfo_start_cb(void *arg) {
-    getaddrinfo_req_t *req = arg;
+    getaddrinfo_state_t *st = arg;
     ip_addr_t addr;
-    err_t err = dns_gethostbyname_addrtype(req->name, &addr, getaddrinfo_found_cb, req, req->addrtype);
+    err_t err = dns_gethostbyname_addrtype(st->name, &addr, getaddrinfo_found_cb, st, st->addrtype);
     if (err == ERR_INPROGRESS) {
         // getaddrinfo_found_cb will publish the result.
         return;
@@ -1204,17 +1195,14 @@ static void getaddrinfo_start_cb(void *arg) {
     int status = -2;
     if (err == ERR_OK) {
         // Answer was already cached.
-        req->addr = addr;
+        st->addr = addr;
         status = 1;
     }
-    __sync_synchronize();
-    req->status = status;
+    getaddrinfo_publish(st, status);
 }
 
 // socket._getaddrinfo_start(host, port, family=0, type=0, proto=0, flags=0)
 static mp_obj_t esp_socket_getaddrinfo_start(size_t n_args, const mp_obj_t *args) {
-    getaddrinfo_req_reap();
-
     mp_int_t family = n_args > 2 ? mp_obj_get_int(args[2]) : 0;
     mp_int_t socktype = n_args > 3 ? mp_obj_get_int(args[3]) : 0;
     mp_int_t proto = n_args > 4 ? mp_obj_get_int(args[4]) : 0;
@@ -1223,36 +1211,39 @@ static mp_obj_t esp_socket_getaddrinfo_start(size_t n_args, const mp_obj_t *args
         socktype = SOCK_STREAM;
     }
 
-    getaddrinfo_req_t *req = mp_obj_malloc(getaddrinfo_req_t, &getaddrinfo_req_type);
-    req->status = 0;
+    size_t name_len;
+    const char *name = mp_obj_str_get_data(args[0], &name_len);
+    getaddrinfo_req_t *req = mp_obj_malloc_with_finaliser(getaddrinfo_req_t, &getaddrinfo_req_type);
+    req->st = NULL;
     req->host = args[0];
-    req->name = mp_obj_str_get_str(args[0]);
     req->port = (uint16_t)mp_obj_get_int(args[1]);
     req->socktype = (uint8_t)socktype;
     req->proto = (uint8_t)proto;
-    req->addrtype = family == AF_INET ? LWIP_DNS_ADDRTYPE_IPV4
+    getaddrinfo_state_t *st = malloc(sizeof(getaddrinfo_state_t) + name_len + 1);
+    if (st == NULL) {
+        mp_raise_OSError(MP_ENOMEM);
+    }
+    memcpy(st->name, name, name_len + 1);
+    st->status = 0;
+    st->refs = 1;   // the object's
+    st->addrtype = family == AF_INET ? LWIP_DNS_ADDRTYPE_IPV4
         : family == AF_INET6 ? LWIP_DNS_ADDRTYPE_IPV6
         : LWIP_DNS_ADDRTYPE_DEFAULT;
-    req->next = NULL;
-    req->listed = false;
+    req->st = st;
 
-    if (ipaddr_aton(req->name, &req->addr)) {
+    if (ipaddr_aton(st->name, &st->addr)) {
         // Already an address literal: nothing to resolve, and nothing to hand
         // to lwIP. CPython short-circuits this case too (_ipaddr_info), but it
         // has to happen here rather than in asyncio, because only the port
         // knows how it spells a sockaddr. Costs ~0.7 ms otherwise, which is
         // most of the event loop's jitter budget.
-        req->status = 1;
+        st->status = 1;
         return MP_OBJ_FROM_PTR(req);
     }
 
-    // On the list before lwIP is told about it, not after.
-    req->next = MP_STATE_PORT(socket_getaddrinfo_req_head);
-    MP_STATE_PORT(socket_getaddrinfo_req_head) = req;
-    req->listed = true;
-
-    if (tcpip_callback(getaddrinfo_start_cb, req) != ERR_OK) {
-        getaddrinfo_req_unlist(req);
+    st->refs = 2;   // and the query's, before lwIP sees it
+    if (tcpip_callback(getaddrinfo_start_cb, st) != ERR_OK) {
+        st->refs = 1;
         mp_raise_OSError(MP_EAGAIN);
     }
 
@@ -1264,26 +1255,24 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(esp_socket_getaddrinfo_start_obj, 2, 
 // and the same errno the blocking path uses if the name did not resolve.
 static mp_obj_t getaddrinfo_req_result(mp_obj_t self_in) {
     getaddrinfo_req_t *req = MP_OBJ_TO_PTR(self_in);
-    int status = req->status;
+    getaddrinfo_state_t *st = req->st;
+    int status = st ? st->status : -2;
     __sync_synchronize();
     if (status == 0) {
         mp_raise_OSError(MP_EAGAIN);
-    }
-    if (req->listed) {
-        getaddrinfo_req_unlist(req);
     }
     if (status < 0) {
         mp_raise_OSError(status);
     }
 
     char buf[IPADDR_STRLEN_MAX];
-    ipaddr_ntoa_r(&req->addr, buf, sizeof(buf));
+    ipaddr_ntoa_r(&st->addr, buf, sizeof(buf));
     mp_obj_t inaddr_objs[2] = {
         mp_obj_new_str_from_cstr(buf),
         mp_obj_new_int(req->port),
     };
     mp_obj_t addrinfo_objs[5] = {
-        mp_obj_new_int(IP_IS_V6(&req->addr) ? AF_INET6 : AF_INET),
+        mp_obj_new_int(IP_IS_V6(&st->addr) ? AF_INET6 : AF_INET),
         mp_obj_new_int(req->socktype),
         mp_obj_new_int(req->proto),
         req->host, // canonname: echo what was asked for, lwIP's DNS does not give one
@@ -1294,18 +1283,34 @@ static mp_obj_t getaddrinfo_req_result(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(getaddrinfo_req_result_obj, getaddrinfo_req_result);
 
+// The object's end, when the GC collects it or a soft reset sweeps the heap.
+static mp_obj_t getaddrinfo_req_del(mp_obj_t self_in) {
+    getaddrinfo_req_t *req = MP_OBJ_TO_PTR(self_in);
+    if (req->st != NULL) {
+        getaddrinfo_state_release(req->st);
+        req->st = NULL;
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(getaddrinfo_req_del_obj, getaddrinfo_req_del);
+
 static mp_uint_t getaddrinfo_req_ioctl(mp_obj_t self_in, mp_uint_t request, uintptr_t arg, int *errcode) {
     getaddrinfo_req_t *req = MP_OBJ_TO_PTR(self_in);
-    if (request != MP_STREAM_POLL) {
-        *errcode = MP_EINVAL;
-        return MP_STREAM_ERROR;
+    if (request == MP_STREAM_POLL) {
+        // Readable once there is something to collect, success or failure alike.
+        return (arg & MP_STREAM_POLL_RD) && (req->st == NULL || req->st->status != 0) ? MP_STREAM_POLL_RD : 0;
     }
-    // Readable once there is something to collect, success or failure alike.
-    return (arg & MP_STREAM_POLL_RD) && req->status != 0 ? MP_STREAM_POLL_RD : 0;
+    if (request == MP_STREAM_POLL_WAKES) {
+        // The query's end wakes the main task (getaddrinfo_publish).
+        return 1;
+    }
+    *errcode = MP_EINVAL;
+    return MP_STREAM_ERROR;
 }
 
 static const mp_rom_map_elem_t getaddrinfo_req_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_result), MP_ROM_PTR(&getaddrinfo_req_result_obj) },
+    { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&getaddrinfo_req_del_obj) },
 };
 static MP_DEFINE_CONST_DICT(getaddrinfo_req_locals_dict, getaddrinfo_req_locals_dict_table);
 
@@ -1360,7 +1365,6 @@ static const mp_rom_map_elem_t mp_module_socket_globals_table[] = {
 
 static MP_DEFINE_CONST_DICT(mp_module_socket_globals, mp_module_socket_globals_table);
 
-MP_REGISTER_ROOT_POINTER(struct _getaddrinfo_req_t *socket_getaddrinfo_req_head);
 
 const mp_obj_module_t mp_module_socket = {
     .base = { &mp_type_module },
