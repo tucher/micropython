@@ -353,6 +353,13 @@ void *esp_native_code_commit(void *, size_t, void *);
 // half is MICROPY_INTERNAL_WFE in mphalport.h.
 #define MICROPY_INTERNAL_EVENT_HOOK MICROPY_PY_SOCKET_EVENTS_HANDLER
 
+// Anything scheduled wakes the main task, so a callback queued by another task
+// or an ISR runs without waiting for a polling period -- needed once a wait
+// can have none (MICROPY_HAL_WAIT_UNCAPPED). Inside the scheduler's critical
+// section, so it must not yield.
+void mp_hal_wake_main_task_deferred(void);
+#define MICROPY_SCHED_HOOK_SCHEDULED mp_hal_wake_main_task_deferred()
+
 // Functions that should go in IRAM
 // For ESP32 with SPIRAM workaround, firmware is larger and uses more static IRAM,
 // so in that configuration don't put too many functions in IRAM.
