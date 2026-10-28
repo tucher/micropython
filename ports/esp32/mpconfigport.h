@@ -48,6 +48,12 @@ void esp32_gc_heap_free(void *ptr);
 #define MP_PLAT_FREE_HEAP(ptr)              esp32_gc_heap_free(ptr)
 #endif
 
+// A board's safe mode: when this is true, after _boot.py, the frozen _safe.py
+// runs instead of boot.py and main.py. Checked on every boot and soft reset.
+#ifndef MICROPY_BOARD_SAFE_MODE
+#define MICROPY_BOARD_SAFE_MODE() (false)
+#endif
+
 // emitters
 #define MICROPY_PERSISTENT_CODE_LOAD        (1)
 #if CONFIG_IDF_TARGET_ARCH_RISCV

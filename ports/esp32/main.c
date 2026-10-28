@@ -153,19 +153,27 @@ soft_reset:
 
     // run boot-up scripts
     pyexec_frozen_module("_boot.py", false);
-    int ret = pyexec_file_if_exists("boot.py");
+    if (MICROPY_BOARD_SAFE_MODE()) {
+        // Safe mode: the board's frozen _safe.py instead of boot.py and main.py.
+        pyexec_frozen_module("_safe.py", false);
+        #if MICROPY_HW_ENABLE_USBDEV
+        mp_usbd_init();
+        #endif
+    } else {
+        int ret = pyexec_file_if_exists("boot.py");
 
-    #if MICROPY_HW_ENABLE_USBDEV
-    mp_usbd_init();
-    #endif
+        #if MICROPY_HW_ENABLE_USBDEV
+        mp_usbd_init();
+        #endif
 
-    if (ret & PYEXEC_FORCED_EXIT) {
-        goto soft_reset_exit;
-    }
-    if (pyexec_mode_kind == PYEXEC_MODE_FRIENDLY_REPL && ret != 0) {
-        int ret = pyexec_file_if_exists("main.py");
         if (ret & PYEXEC_FORCED_EXIT) {
             goto soft_reset_exit;
+        }
+        if (pyexec_mode_kind == PYEXEC_MODE_FRIENDLY_REPL && ret != 0) {
+            int ret = pyexec_file_if_exists("main.py");
+            if (ret & PYEXEC_FORCED_EXIT) {
+                goto soft_reset_exit;
+            }
         }
     }
 
