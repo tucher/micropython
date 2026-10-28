@@ -96,6 +96,12 @@ void usb_serial_jtag_init(void) {
         USB_SERIAL_JTAG_INTR_SOF | USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY);
     ESP_ERROR_CHECK(esp_intr_alloc(ETS_USB_SERIAL_JTAG_INTR_SOURCE, ESP_INTR_FLAG_LEVEL1,
         usb_serial_jtag_isr_handler, NULL, NULL));
+    // A packet the host sent while the chip was restarting (a reset leaves the
+    // USB connection up) is still in the FIFO, and clearing RECV_PKT above lost
+    // its interrupt. Until it is read the endpoint takes nothing more, and the
+    // only other reader is a stdin poll -- which a running main.py never does --
+    // so Ctrl-C would not get through again until the next hard reset.
+    usb_serial_jtag_poll_rx();
 }
 
 void usb_serial_jtag_poll_rx(void) {
