@@ -34,6 +34,7 @@
 #include "py/gc.h"
 #include "py/mpthread.h"
 #include "gccollect.h"
+#include "esp_heap_caps.h"
 
 #if CONFIG_IDF_TARGET_ARCH_XTENSA
 
@@ -80,9 +81,25 @@ void gc_collect(void) {
 #if MICROPY_GC_SPLIT_HEAP_AUTO
 
 // The largest new region that is available to become Python heap is the largest
-// free block in the ESP-IDF system heap.
+// free block in the ESP-IDF system heap, or in the part of it the board allows.
 size_t gc_get_max_new_split(void) {
+    #ifdef MICROPY_GC_HEAP_CAPS
+    return heap_caps_get_largest_free_block(MICROPY_GC_HEAP_CAPS);
+    #else
     return heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    #endif
+}
+
+#endif
+
+#ifdef MICROPY_GC_HEAP_CAPS
+
+void *esp32_gc_heap_alloc(size_t size) {
+    return heap_caps_malloc(size, MICROPY_GC_HEAP_CAPS);
+}
+
+void esp32_gc_heap_free(void *ptr) {
+    heap_caps_free(ptr);
 }
 
 #endif

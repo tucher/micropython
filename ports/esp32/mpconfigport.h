@@ -37,6 +37,17 @@
 #endif
 #endif
 
+// Where the Python heap may live and grow: ESP-IDF heap capabilities, for
+// example MALLOC_CAP_SPIRAM, so that a full Python heap never takes the
+// internal RAM that DMA and the radio drivers need. Unset, the heap is
+// malloc()ed and grows into the largest free block of any kind.
+#ifdef MICROPY_GC_HEAP_CAPS
+void *esp32_gc_heap_alloc(size_t size);
+void esp32_gc_heap_free(void *ptr);
+#define MP_PLAT_ALLOC_HEAP(size)            esp32_gc_heap_alloc(size)
+#define MP_PLAT_FREE_HEAP(ptr)              esp32_gc_heap_free(ptr)
+#endif
+
 // emitters
 #define MICROPY_PERSISTENT_CODE_LOAD        (1)
 #if CONFIG_IDF_TARGET_ARCH_RISCV
