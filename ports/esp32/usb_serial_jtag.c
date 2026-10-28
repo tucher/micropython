@@ -90,10 +90,12 @@ static void usb_serial_jtag_isr_handler(void *arg) {
 void usb_serial_jtag_init(void) {
     // Note: Don't clear the SERIAL_IN_EMPTY interrupt, as it's possible the
     // bootloader wrote enough data to the host that we need the interrupt to flush it.
-    usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT |
-        USB_SERIAL_JTAG_INTR_SOF);
+    // SOF is left alone: ESP-IDF's connection monitor reads its raw bit on every
+    // tick for usb_serial_jtag_is_connected(), and an ISR clearing it would make
+    // a host look absent.
+    usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
     usb_serial_jtag_ll_ena_intr_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT |
-        USB_SERIAL_JTAG_INTR_SOF | USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY);
+        USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY);
     ESP_ERROR_CHECK(esp_intr_alloc(ETS_USB_SERIAL_JTAG_INTR_SOURCE, ESP_INTR_FLAG_LEVEL1,
         usb_serial_jtag_isr_handler, NULL, NULL));
     // A packet the host sent while the chip was restarting (a reset leaves the
