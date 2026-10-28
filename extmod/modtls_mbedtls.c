@@ -73,6 +73,31 @@
 
 #define MP_STREAM_POLL_RDWR (MP_STREAM_POLL_RD | MP_STREAM_POLL_WR)
 
+// A default root-CA store: SSLContext.load_default_certs(), as in CPython.
+//
+// The board provides the store, as mp_ssl_default_ca_lookup(), which parses
+// into `out` every root whose subject is `name` and returns how many it added.
+// Loading all ~150 roots into the context up front costs ~360 ms and ~50 KB of
+// internal RAM on an ESP32-S3, so nothing is loaded: the handshake runs without
+// verification and keeps the server's chain, then -- before a single byte of
+// application data moves either way -- the chain is verified against just the
+// roots its issuers name, with mbedtls_x509_crt_verify_restartable(), in pieces
+// like the handshake's ECC when MBEDTLS_ECP_RESTARTABLE. mbedtls's own
+// CA-callback path is not used because it cannot be restarted.
+#ifndef MICROPY_PY_SSL_DEFAULT_CAS
+#define MICROPY_PY_SSL_DEFAULT_CAS (0)
+#endif
+#if MICROPY_PY_SSL_DEFAULT_CAS
+int mp_ssl_default_ca_lookup(const mbedtls_x509_buf *name, mbedtls_x509_crt *out);
+#endif
+
+// A clock that has never been set cannot say whether a certificate has expired
+// or is not yet valid. Below this time_t, those two flags are ignored and the
+// chain, signatures and hostname are still checked. 0 disables the rule.
+#ifndef MICROPY_PY_SSL_CLOCK_VALID_AFTER
+#define MICROPY_PY_SSL_CLOCK_VALID_AFTER (0)
+#endif
+
 #define MP_ENDPOINT_IS_SERVER (1 << 0)
 #define MP_TRANSPORT_IS_DTLS  (1 << 1)
 
@@ -105,6 +130,9 @@ typedef struct _mp_obj_ssl_context_t {
     bool is_dtls_server;
     mbedtls_ssl_cookie_ctx cookie_ctx;
     #endif
+    #if MICROPY_PY_SSL_DEFAULT_CAS
+    bool default_cas; // load_default_certs() was called
+    #endif
 } mp_obj_ssl_context_t;
 
 // This corresponds to an SSLSocket object.
@@ -118,6 +146,14 @@ typedef struct _mp_obj_ssl_socket_t {
     int last_error; // The last error code, if any
     #if defined(MBEDTLS_ECP_RESTARTABLE)
     bool computing; // A restartable ECC computation is under way: ready again at once
+    #endif
+    #if MICROPY_PY_SSL_DEFAULT_CAS
+    uint8_t post_verify; // 0: not ours to verify, 1: due once the handshake is over, 2: passed
+    uint32_t verify_flags;
+    mbedtls_x509_crt roots; // the default roots this chain names, parsed from the store
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    mbedtls_x509_crt_restart_ctx verify_rs;
+    #endif
     #endif
 
     #ifdef MBEDTLS_SSL_PROTO_DTLS
@@ -268,6 +304,11 @@ static void ssl_check_async_handshake_failure(mp_obj_ssl_socket_t *sslsock, int 
 
 static int ssl_sock_cert_verify(void *ptr, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
     mp_obj_ssl_context_t *o = ptr;
+    #if MICROPY_PY_SSL_CLOCK_VALID_AFTER
+    if (time(NULL) < (time_t)MICROPY_PY_SSL_CLOCK_VALID_AFTER) {
+        *flags &= ~(MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE);
+    }
+    #endif
     if (o->handler == mp_const_none) {
         return 0;
     }
@@ -304,6 +345,9 @@ static mp_obj_t ssl_context_make_new(const mp_obj_type_t *type_in, size_t n_args
     mbedtls_pk_init(&self->pkey);
     self->ciphersuites = NULL;
     self->handler = mp_const_none;
+    #if MICROPY_PY_SSL_DEFAULT_CAS
+    self->default_cas = false;
+    #endif
     #if MICROPY_PY_SSL_ECDSA_SIGN_ALT
     self->ecdsa_sign_callback = mp_const_none;
     #endif
@@ -371,6 +415,19 @@ static int ssl_context_psk_server_callback(void *p_ctx, mbedtls_ssl_context *ssl
 static void ssl_context_set_psk(mp_obj_ssl_context_t *self);
 #endif
 
+// Puts the context's verify_mode into the mbedtls config -- except that when
+// the default store is in use (and no CAs were loaded explicitly), a required
+// verification is done after the handshake rather than inside it.
+static void ssl_context_apply_authmode(mp_obj_ssl_context_t *self) {
+    int mode = self->authmode;
+    #if MICROPY_PY_SSL_DEFAULT_CAS
+    if (self->default_cas && mode == MBEDTLS_SSL_VERIFY_REQUIRED && self->cacert.version == 0) {
+        mode = MBEDTLS_SSL_VERIFY_NONE;
+    }
+    #endif
+    mbedtls_ssl_conf_authmode(&self->conf, mode);
+}
+
 static void ssl_context_attr(mp_obj_t self_in, qstr attr, mp_obj_t *dest) {
     mp_obj_ssl_context_t *self = MP_OBJ_TO_PTR(self_in);
     if (dest[0] == MP_OBJ_NULL) {
@@ -400,7 +457,7 @@ static void ssl_context_attr(mp_obj_t self_in, qstr attr, mp_obj_t *dest) {
         if (attr == MP_QSTR_verify_mode) {
             self->authmode = mp_obj_get_int(dest[1]);
             dest[0] = MP_OBJ_NULL;
-            mbedtls_ssl_conf_authmode(&self->conf, self->authmode);
+            ssl_context_apply_authmode(self);
         #if MICROPY_PY_SSL_ECDSA_SIGN_ALT
         } else if (attr == MP_QSTR_ecdsa_sign_callback) {
             dest[0] = MP_OBJ_NULL;
@@ -532,6 +589,7 @@ static void ssl_context_load_cadata(mp_obj_ssl_context_t *self, mp_obj_t cadata_
     }
 
     mbedtls_ssl_conf_ca_chain(&self->conf, &self->cacert, NULL);
+    ssl_context_apply_authmode(self);
 }
 
 // SSLContext.load_verify_locations(cadata)
@@ -660,6 +718,17 @@ static mp_obj_t ssl_context_wrap_socket(size_t n_args, const mp_obj_t *pos_args,
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(ssl_context_wrap_socket_obj, 2, ssl_context_wrap_socket);
 
+#if MICROPY_PY_SSL_DEFAULT_CAS
+// SSLContext.load_default_certs()
+static mp_obj_t ssl_context_load_default_certs(mp_obj_t self_in) {
+    mp_obj_ssl_context_t *self = MP_OBJ_TO_PTR(self_in);
+    self->default_cas = true;
+    ssl_context_apply_authmode(self);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(ssl_context_load_default_certs_obj, ssl_context_load_default_certs);
+#endif
+
 static const mp_rom_map_elem_t ssl_context_locals_dict_table[] = {
     #if MICROPY_PY_SSL_FINALISER
     { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&ssl_context___del___obj) },
@@ -668,6 +737,9 @@ static const mp_rom_map_elem_t ssl_context_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_set_ciphers), MP_ROM_PTR(&ssl_context_set_ciphers_obj)},
     { MP_ROM_QSTR(MP_QSTR_load_cert_chain), MP_ROM_PTR(&ssl_context_load_cert_chain_obj)},
     { MP_ROM_QSTR(MP_QSTR_load_verify_locations), MP_ROM_PTR(&ssl_context_load_verify_locations_obj)},
+    #if MICROPY_PY_SSL_DEFAULT_CAS
+    { MP_ROM_QSTR(MP_QSTR_load_default_certs), MP_ROM_PTR(&ssl_context_load_default_certs_obj)},
+    #endif
     { MP_ROM_QSTR(MP_QSTR_wrap_socket), MP_ROM_PTR(&ssl_context_wrap_socket_obj) },
 };
 static MP_DEFINE_CONST_DICT(ssl_context_locals_dict, ssl_context_locals_dict_table);
@@ -752,6 +824,107 @@ static int _mbedtls_timing_get_delay(void *ctx) {
 }
 #endif
 
+#if MICROPY_PY_SSL_DEFAULT_CAS
+static void ssl_verify_release(mp_obj_ssl_socket_t *o) {
+    mbedtls_x509_crt_free(&o->roots);
+    mbedtls_x509_crt_init(&o->roots);
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    mbedtls_x509_crt_restart_free(&o->verify_rs);
+    mbedtls_x509_crt_restart_init(&o->verify_rs);
+    #endif
+}
+
+// One step of verifying the server's chain against the default store, once
+// the handshake is over. Returns 0 when it passed, CRYPTO_IN_PROGRESS when a
+// piece is done and more remains, or X509_CERT_VERIFY_FAILED with the reasons
+// in o->verify_flags.
+static int ssl_verify_step(mp_obj_ssl_socket_t *o) {
+    mbedtls_x509_crt *chain = (mbedtls_x509_crt *)mbedtls_ssl_get_peer_cert(&o->ssl);
+    if (chain == NULL) {
+        o->verify_flags = MBEDTLS_X509_BADCERT_MISSING;
+        return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+    }
+    if (o->roots.version == 0) {
+        // The roots any certificate in the chain names as its issuer; usually
+        // one, more where a CA has been re-keyed or cross-signed.
+        for (const mbedtls_x509_crt *c = chain; c != NULL; c = c->next) {
+            mp_ssl_default_ca_lookup(&c->issuer_raw, &o->roots);
+        }
+        if (o->roots.version == 0) {
+            o->verify_flags = MBEDTLS_X509_BADCERT_NOT_TRUSTED;
+            return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+        }
+    }
+    o->verify_flags = 0;
+    int ret = mbedtls_x509_crt_verify_restartable(chain, &o->roots, NULL,
+        &mbedtls_x509_crt_profile_default, mbedtls_ssl_get_hostname(&o->ssl),
+        &o->verify_flags, ssl_sock_cert_verify, o->ssl_context,
+        #if defined(MBEDTLS_ECP_RESTARTABLE)
+        &o->verify_rs
+        #else
+        NULL
+        #endif
+        );
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    if (ret == MBEDTLS_ERR_ECP_IN_PROGRESS) {
+        return MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS;
+    }
+    #endif
+    ssl_verify_release(o);
+    if (ret != 0) {
+        if (o->verify_flags == 0) {
+            o->verify_flags = MBEDTLS_X509_BADCERT_OTHER;
+        }
+        return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+    }
+    o->post_verify = 2;
+    return 0;
+}
+
+static MP_NORETURN void ssl_raise_verify_failure(mp_obj_ssl_socket_t *o) {
+    mbedtls_ssl_send_alert_message(&o->ssl, MBEDTLS_SSL_ALERT_LEVEL_FATAL,
+        MBEDTLS_SSL_ALERT_MSG_BAD_CERT);
+    char xcbuf[256];
+    int n = mbedtls_x509_crt_verify_info(xcbuf, sizeof(xcbuf), "\n", o->verify_flags);
+    o->sock = MP_OBJ_NULL;
+    mbedtls_ssl_free(&o->ssl);
+    if (n > 0) {
+        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%s"), xcbuf);
+    }
+    mbedtls_raise_error(MBEDTLS_ERR_X509_CERT_VERIFY_FAILED);
+}
+#endif
+
+// Brings a socket to where application data can move: drives the handshake
+// and, with the default store, verifies the chain before anything is read or
+// written. Returns 0 when ready, or an mbedtls code to be handled as one from
+// mbedtls_ssl_read/write would be.
+static int ssl_prepare(mp_obj_ssl_socket_t *o) {
+    #if MICROPY_PY_SSL_DEFAULT_CAS
+    if (o->post_verify == 1) {
+        if (!mbedtls_ssl_is_handshake_over(&o->ssl)) {
+            int ret = mbedtls_ssl_handshake(&o->ssl);
+            if (ret != 0) {
+                return ret;
+            }
+        }
+        return ssl_verify_step(o);
+    }
+    #endif
+    (void)o;
+    return 0;
+}
+
+static int ssl_read_step(mp_obj_ssl_socket_t *o, void *buf, size_t size) {
+    int ret = ssl_prepare(o);
+    return ret != 0 ? ret : mbedtls_ssl_read(&o->ssl, buf, size);
+}
+
+static int ssl_write_step(mp_obj_ssl_socket_t *o, const void *buf, size_t size) {
+    int ret = ssl_prepare(o);
+    return ret != 0 ? ret : mbedtls_ssl_write(&o->ssl, buf, size);
+}
+
 static mp_obj_t ssl_socket_make_new(mp_obj_ssl_context_t *ssl_context, mp_obj_t sock,
     bool server_side, bool do_handshake_on_connect, mp_obj_t server_hostname, mp_obj_t client_id) {
 
@@ -773,6 +946,16 @@ static mp_obj_t ssl_socket_make_new(mp_obj_ssl_context_t *ssl_context, mp_obj_t 
     o->computing = false;
     #endif
     o->last_error = 0;
+    #if MICROPY_PY_SSL_DEFAULT_CAS
+    o->post_verify = (!server_side && ssl_context->default_cas
+        && ssl_context->authmode == MBEDTLS_SSL_VERIFY_REQUIRED
+        && ssl_context->cacert.version == 0) ? 1 : 0;
+    o->verify_flags = 0;
+    mbedtls_x509_crt_init(&o->roots);
+    #if defined(MBEDTLS_ECP_RESTARTABLE)
+    mbedtls_x509_crt_restart_init(&o->verify_rs);
+    #endif
+    #endif
 
     int ret;
     uint32_t flags = 0;
@@ -845,17 +1028,31 @@ static mp_obj_t ssl_socket_make_new(mp_obj_ssl_context_t *ssl_context, mp_obj_t 
             }
             mp_event_wait_ms(1);
         }
+        #if MICROPY_PY_SSL_DEFAULT_CAS
+        while (o->post_verify == 1) {
+            ret = ssl_verify_step(o);
+            if (ret == MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS) {
+                mp_event_handle_nowait();
+            } else if (ret != 0) {
+                flags = o->verify_flags;
+                goto cleanup;
+            }
+        }
+        #endif
     }
 
     return MP_OBJ_FROM_PTR(o);
 
 cleanup:
-    if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+    if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED && flags == 0) {
         flags = mbedtls_ssl_get_verify_result(&o->ssl);
     }
 
     o->sock = MP_OBJ_NULL;
     mbedtls_ssl_free(&o->ssl);
+    #if MICROPY_PY_SSL_DEFAULT_CAS
+    ssl_verify_release(o);
+    #endif
 
     if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
         char xcbuf[256];
@@ -911,7 +1108,12 @@ static mp_uint_t socket_read(mp_obj_t o_in, void *buf, mp_uint_t size, int *errc
     // Store the current SSL context.
     store_active_context(o->ssl_context);
 
-    int ret = mbedtls_ssl_read(&o->ssl, buf, size);
+    int ret = ssl_read_step(o, buf, size);
+    #if MICROPY_PY_SSL_DEFAULT_CAS
+    if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED && o->post_verify == 1) {
+        ssl_raise_verify_failure(o);
+    }
+    #endif
     if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
         // end of stream
         return 0;
@@ -965,7 +1167,12 @@ static mp_uint_t socket_write(mp_obj_t o_in, const void *buf, mp_uint_t size, in
     // Store the current SSL context.
     store_active_context(o->ssl_context);
 
-    int ret = mbedtls_ssl_write(&o->ssl, buf, size);
+    int ret = ssl_write_step(o, buf, size);
+    #if MICROPY_PY_SSL_DEFAULT_CAS
+    if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED && o->post_verify == 1) {
+        ssl_raise_verify_failure(o);
+    }
+    #endif
     if (ret >= 0) {
         return ret;
     }
@@ -1017,6 +1224,9 @@ static mp_uint_t socket_ioctl(mp_obj_t o_in, mp_uint_t request, uintptr_t arg, i
         }
         self->sock = MP_OBJ_NULL;
         mbedtls_ssl_free(&self->ssl);
+        #if MICROPY_PY_SSL_DEFAULT_CAS
+        ssl_verify_release(self);
+        #endif
     } else if (request == MP_STREAM_POLL) {
         if (sock == MP_OBJ_NULL || self->last_error != 0) {
             // Closed or error socket, return NVAL flag.
