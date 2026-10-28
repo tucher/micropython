@@ -56,7 +56,7 @@
 [submodule "lib/micropython-lib"]
 	path = lib/micropython-lib
 	url = https://github.com/tucher/micropython-lib.git
-	branch = nalivai-v1.29
+	branch = gadget-v1.29
 [submodule "lib/protobuf-c"]
 	path = lib/protobuf-c
 	url = https://github.com/protobuf-c/protobuf-c.git
