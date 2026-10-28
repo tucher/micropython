@@ -109,6 +109,20 @@ uint32_t mp_hal_get_cpu_freq(void);
 void mp_hal_wake_main_task(void);
 void mp_hal_wake_main_task_from_isr(void);
 
+// Wakes the main task from anywhere -- an ISR, another task, a critical
+// section -- without asking for a context switch; it runs at the scheduler's
+// next decision. For the scheduler's hook (mpconfigport.h).
+void mp_hal_wake_main_task_deferred(void);
+
+// Waits for a wakeup with no polling period, for timeout_ms or, if negative,
+// indefinitely. For waits on things that all wake the task themselves
+// (select.poll, MP_STREAM_POLL_WAKES).
+void mp_hal_wait_event_uncapped(int32_t timeout_ms);
+#define MICROPY_HAL_WAIT_UNCAPPED(timeout_ms) mp_hal_wait_event_uncapped(timeout_ms)
+
+// How many times the main task has come back from waiting: each one a wakeup.
+extern uint32_t mp_hal_wait_wakes;
+
 // How long a wait may last before it goes back and looks again.
 //
 // Nothing on this port wakes a waiting task when a socket becomes readable:

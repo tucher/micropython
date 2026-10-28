@@ -264,6 +264,8 @@ uint64_t mp_hal_time_ns(void) {
 // The notification is what mp_hal_wake_main_task() raises, so anything that can
 // wake the task directly still cuts the wait short; the period only bounds how
 // long we wait for the things that cannot.
+uint32_t mp_hal_wait_wakes;
+
 void mp_hal_wait_event(int32_t timeout_ms) {
     uint32_t wait_ms = MICROPY_EVENT_POLL_PERIOD_MS;
     if (timeout_ms >= 0 && (uint32_t)timeout_ms < wait_ms) {
@@ -278,6 +280,24 @@ void mp_hal_wait_event(int32_t timeout_ms) {
     }
     ulTaskNotifyTake(pdFALSE, ticks);
     MP_THREAD_GIL_ENTER();
+    mp_hal_wait_wakes++;
+}
+
+void mp_hal_wait_event_uncapped(int32_t timeout_ms) {
+    TickType_t ticks = timeout_ms < 0 ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    if (ticks == 0 && timeout_ms > 0) {
+        ticks = 1;
+    }
+    MP_THREAD_GIL_EXIT();
+    ulTaskNotifyTake(pdFALSE, ticks);
+    MP_THREAD_GIL_ENTER();
+    mp_hal_wait_wakes++;
+}
+
+void mp_hal_wake_main_task_deferred(void) {
+    if (mp_main_task_handle != NULL) {
+        vTaskNotifyGiveFromISR(mp_main_task_handle, NULL);
+    }
 }
 
 void mp_hal_wake_main_task(void) {
