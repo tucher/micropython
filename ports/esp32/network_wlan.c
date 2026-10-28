@@ -388,6 +388,10 @@ static mp_obj_t network_wlan_connect(size_t n_args, const mp_obj_t *pos_args, mp
     esp_exceptions(esp_netif_set_hostname(wlan_sta_obj.netif, mod_network_hostname_data));
 
     wifi_sta_reconnects = 0;
+    // Forget how the last connection ended: status() puts that reason first, so
+    // after a disconnect() it would say STAT_IDLE until this attempt fails or
+    // succeeds, rather than STAT_CONNECTING.
+    wifi_sta_disconn_reason = 0;
     // connect to the WiFi AP
     MP_THREAD_GIL_EXIT();
     esp_exceptions(esp_wifi_connect());
