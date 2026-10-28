@@ -85,6 +85,14 @@ typedef struct _mp_stream_c_writer_t {
     size_t max_write;
 } mp_stream_c_writer_t;
 
+#define MP_STREAM_POLL_WAKES        (15) // Does readiness wake a waiting poll?
+
+// Answered 1 by a stream whose every change to "ready" also wakes the VM's
+// waiting task (on ports that have such a wakeup, mp_hal_wake_main_task on
+// esp32). select.poll may then wait for such streams without a polling period;
+// a stream that does not answer, or answers anything else, is assumed to need
+// one.
+
 // These poll ioctl values are compatible with Linux
 #define MP_STREAM_POLL_RD       (0x0001)
 #define MP_STREAM_POLL_WR       (0x0004)

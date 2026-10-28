@@ -444,6 +444,20 @@ static mp_uint_t poll_set_poll_until_ready_or_timeout(poll_set_t *poll_set, size
 
     #else
 
+    #ifdef MICROPY_HAL_WAIT_UNCAPPED
+    // If every object wakes the task itself when it becomes ready, the wait
+    // needs no polling period: sleep until woken or the timeout. One object
+    // that does not (a socket, say) brings the period back for all.
+    bool all_wake = true;
+    for (mp_uint_t i = 0; i < poll_set->map.alloc && all_wake; ++i) {
+        if (mp_map_slot_is_filled(&poll_set->map, i)) {
+            poll_obj_t *poll_obj = MP_OBJ_TO_PTR(poll_set->map.table[i].value);
+            int errcode;
+            all_wake = poll_obj->ioctl(poll_obj->obj, MP_STREAM_POLL_WAKES, 0, &errcode) == 1;
+        }
+    }
+    #endif
+
     for (;;) {
         // poll the objects
         mp_uint_t n_ready = poll_set_poll_once(poll_set, rwx_num);
@@ -451,6 +465,13 @@ static mp_uint_t poll_set_poll_until_ready_or_timeout(poll_set_t *poll_set, size
         if (n_ready > 0 || (has_timeout && elapsed >= timeout)) {
             return n_ready;
         }
+        #ifdef MICROPY_HAL_WAIT_UNCAPPED
+        if (all_wake) {
+            mp_event_handle_nowait();
+            MICROPY_HAL_WAIT_UNCAPPED(has_timeout ? (int32_t)(timeout - elapsed) : -1);
+            continue;
+        }
+        #endif
         if (has_timeout) {
             mp_event_wait_ms(timeout - elapsed);
         } else {
