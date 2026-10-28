@@ -36,6 +36,8 @@
 #include "py/objlist.h"
 #include "py/runtime.h"
 #include "py/mphal.h"
+#include "py/mperrno.h"
+#include "py/stream.h"
 #include "extmod/modnetwork.h"
 #include "shared/netutils/netutils.h"
 #include "modnetwork.h"
@@ -47,6 +49,7 @@
 #endif
 #include "esp_log.h"
 #include "esp_psram.h"
+#include "esp_heap_caps.h"
 #if !CONFIG_ESP_HOSTED_ENABLED
 #include "esp_wifi_ap_get_sta_list.h"
 #endif
@@ -87,6 +90,14 @@ bool mdns_initialised = false;
 static uint8_t conf_wifi_sta_reconnects = 0;
 static uint8_t wifi_sta_reconnects;
 
+// For event loops: WLAN._scan_start() and WLAN._changes() (see below). The
+// event handlers only count and wake the MicroPython task; the objects compare
+// the counts with what they saw, so the driver never holds a pointer to them.
+static volatile bool wifi_scan_running;     // a _scan_start() scan is under way
+static volatile bool wifi_scan_failed;      // how the last one ended
+static volatile uint32_t wifi_scan_done;    // _scan_start() scans finished so far
+static volatile uint32_t wifi_changes;      // STA, AP and IP events so far
+
 // The rules for this default are defined in the documentation of esp_wifi_set_protocol()
 // rather than in code, so we have to recreate them here.
 #if CONFIG_SOC_WIFI_HE_SUPPORT
@@ -108,7 +119,25 @@ static void network_wlan_wifi_event_handler(void *event_handler_arg, esp_event_b
 
         case WIFI_EVENT_STA_STOP:
             wlan_sta_obj.active = false;
+            if (wifi_scan_running) {
+                // Stopping the interface ends a scan without a SCAN_DONE.
+                wifi_scan_failed = true;
+                wifi_scan_running = false;
+                __sync_synchronize();
+                wifi_scan_done++;
+            }
             break;
+
+        case WIFI_EVENT_SCAN_DONE:
+            if (wifi_scan_running) {
+                // A blocking scan() also ends here; it collects its own results.
+                wifi_scan_failed = ((wifi_event_sta_scan_done_t *)event_data)->status != 0;
+                wifi_scan_running = false;
+                __sync_synchronize();
+                wifi_scan_done++;
+                mp_hal_wake_main_task();
+            }
+            return;
 
         case WIFI_EVENT_STA_CONNECTED:
             ESP_LOGI("network", "CONNECTED");
@@ -187,6 +216,8 @@ static void network_wlan_wifi_event_handler(void *event_handler_arg, esp_event_b
         default:
             break;
     }
+    wifi_changes++;
+    mp_hal_wake_main_task();
 }
 
 static void network_wlan_ip_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
@@ -210,6 +241,8 @@ static void network_wlan_ip_event_handler(void *event_handler_arg, esp_event_bas
         default:
             break;
     }
+    wifi_changes++;
+    mp_hal_wake_main_task();
 }
 
 static void require_if(mp_obj_t wlan_if, int if_no) {
@@ -459,12 +492,35 @@ static mp_obj_t network_wlan_status(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(network_wlan_status_obj, 1, 2, network_wlan_status);
 
-static mp_obj_t network_wlan_scan(mp_obj_t self_in) {
-    // check that STA mode is active
+static mp_obj_t wifi_scan_list(const wifi_ap_record_t *records, uint16_t count) {
+    mp_obj_t list = mp_obj_new_list(0, NULL);
+    for (uint16_t i = 0; i < count; i++) {
+        mp_obj_tuple_t *t = mp_obj_new_tuple(6, NULL);
+        uint8_t *x = memchr(records[i].ssid, 0, sizeof(records[i].ssid));
+        int ssid_len = x ? x - records[i].ssid : sizeof(records[i].ssid);
+        t->items[0] = mp_obj_new_bytes(records[i].ssid, ssid_len);
+        t->items[1] = mp_obj_new_bytes(records[i].bssid, sizeof(records[i].bssid));
+        t->items[2] = MP_OBJ_NEW_SMALL_INT(records[i].primary);
+        t->items[3] = MP_OBJ_NEW_SMALL_INT(records[i].rssi);
+        t->items[4] = MP_OBJ_NEW_SMALL_INT(records[i].authmode);
+        t->items[5] = mp_const_false; // XXX hidden?
+        mp_obj_list_append(list, MP_OBJ_FROM_PTR(t));
+    }
+    return list;
+}
+
+static void require_sta_mode(void) {
     wifi_mode_t mode;
     esp_exceptions(esp_wifi_get_mode(&mode));
     if ((mode & WIFI_MODE_STA) == 0) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("STA must be active"));
+    }
+}
+
+static mp_obj_t network_wlan_scan(mp_obj_t self_in) {
+    require_sta_mode();
+    if (wifi_scan_running) {
+        mp_raise_OSError(MP_EBUSY);
     }
 
     mp_obj_t list = mp_obj_new_list(0, NULL);
@@ -484,23 +540,200 @@ static mp_obj_t network_wlan_scan(mp_obj_t self_in) {
         }
         wifi_ap_record_t *wifi_ap_records = calloc(count, sizeof(wifi_ap_record_t));
         esp_exceptions(esp_wifi_scan_get_ap_records(&count, wifi_ap_records));
-        for (uint16_t i = 0; i < count; i++) {
-            mp_obj_tuple_t *t = mp_obj_new_tuple(6, NULL);
-            uint8_t *x = memchr(wifi_ap_records[i].ssid, 0, sizeof(wifi_ap_records[i].ssid));
-            int ssid_len = x ? x - wifi_ap_records[i].ssid : sizeof(wifi_ap_records[i].ssid);
-            t->items[0] = mp_obj_new_bytes(wifi_ap_records[i].ssid, ssid_len);
-            t->items[1] = mp_obj_new_bytes(wifi_ap_records[i].bssid, sizeof(wifi_ap_records[i].bssid));
-            t->items[2] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].primary);
-            t->items[3] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].rssi);
-            t->items[4] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].authmode);
-            t->items[5] = mp_const_false; // XXX hidden?
-            mp_obj_list_append(list, MP_OBJ_FROM_PTR(t));
-        }
+        list = wifi_scan_list(wifi_ap_records, count);
         free(wifi_ap_records);
     }
     return list;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(network_wlan_scan_obj, network_wlan_scan);
+
+// A scan for event loops: WLAN._scan_start() starts it and returns at once; the
+// object it returns reads readable through select.poll() when the scan is over,
+// and its result() gives what scan() would have. The handler for SCAN_DONE
+// wakes the MicroPython task, so the poll needs no period to see it
+// (MP_STREAM_POLL_WAKES).
+//
+// There is one scan at a time. A _scan_start() during a scan joins it. The
+// driver keeps one list of results, which the next scan replaces, so the first
+// result() of a scan moves them into a buffer here, from which every request
+// for that scan reads. Only the MicroPython task touches that buffer.
+
+typedef struct _wlan_scan_req_t {
+    mp_obj_base_t base;
+    uint32_t until;                         // done when wifi_scan_done reaches it
+} wlan_scan_req_t;
+
+static wifi_ap_record_t *wifi_scan_records;
+static uint16_t wifi_scan_nrecords;
+static bool wifi_scan_records_ok;
+static uint32_t wifi_scan_collected;        // the scan whose results are held
+
+static bool wlan_scan_req_done(wlan_scan_req_t *req) {
+    return (int32_t)(wifi_scan_done - req->until) >= 0;
+}
+
+// Take the results of the last finished scan from the driver, unless held already.
+static void wifi_scan_collect(void) {
+    uint32_t done = wifi_scan_done;
+    __sync_synchronize();
+    if (done == wifi_scan_collected) {
+        return;
+    }
+    heap_caps_free(wifi_scan_records);
+    wifi_scan_records = NULL;
+    wifi_scan_nrecords = 0;
+    wifi_scan_records_ok = !wifi_scan_failed;
+    uint16_t count = 0;
+    if (wifi_scan_records_ok && esp_wifi_scan_get_ap_num(&count) == ESP_OK && count > 0) {
+        // PSRAM if there is any: they stay until the next scan.
+        wifi_scan_records = heap_caps_malloc_prefer(count * sizeof(wifi_ap_record_t), 2,
+            MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+        if (wifi_scan_records != NULL && esp_wifi_scan_get_ap_records(&count, wifi_scan_records) == ESP_OK) {
+            wifi_scan_nrecords = count;
+        }
+    }
+    if (wifi_scan_nrecords == 0) {
+        esp_wifi_clear_ap_list(); // frees the driver's list whatever happened above
+    }
+    wifi_scan_collected = done;
+}
+
+static const mp_obj_type_t wlan_scan_req_type;
+
+// WLAN._scan_start(*, channel=0, dwell=0, hidden=True): channel 0 is all of
+// them; dwell is the active scan's time per channel in ms, 0 the driver's
+// default (120).
+static mp_obj_t network_wlan_scan_start(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_channel, ARG_dwell, ARG_hidden };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_channel, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_dwell, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_hidden, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+    require_if(pos_args[0], ESP_IF_WIFI_STA);
+    require_sta_mode();
+
+    wlan_scan_req_t *req = mp_obj_malloc(wlan_scan_req_t, &wlan_scan_req_type);
+    req->until = wifi_scan_done + 1;
+    if (!wifi_scan_running) {
+        // The driver is about to replace its results: keep the last ones for
+        // requests that have not collected them yet.
+        wifi_scan_collect();
+        wifi_scan_config_t config = { 0 };
+        config.channel = args[ARG_channel].u_int;
+        config.show_hidden = args[ARG_hidden].u_bool;
+        config.scan_time.active.max = args[ARG_dwell].u_int;
+        wifi_scan_running = true;
+        esp_err_t err = esp_wifi_scan_start(&config, false);
+        if (err != ESP_OK) {
+            wifi_scan_running = false;
+            esp_exceptions(err);
+        }
+    }
+    return MP_OBJ_FROM_PTR(req);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(network_wlan_scan_start_obj, 1, network_wlan_scan_start);
+
+// The networks found, as scan() returns them. EAGAIN before the scan is over;
+// ECANCELED if it did not finish (the interface stopped, or a connect broke in).
+static mp_obj_t wlan_scan_req_result(mp_obj_t self_in) {
+    wlan_scan_req_t *req = MP_OBJ_TO_PTR(self_in);
+    if (!wlan_scan_req_done(req)) {
+        mp_raise_OSError(MP_EAGAIN);
+    }
+    wifi_scan_collect();
+    if (!wifi_scan_records_ok) {
+        mp_raise_OSError(MP_ECANCELED);
+    }
+    return wifi_scan_list(wifi_scan_records, wifi_scan_nrecords);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(wlan_scan_req_result_obj, wlan_scan_req_result);
+
+static mp_uint_t wlan_scan_req_ioctl(mp_obj_t self_in, mp_uint_t request, uintptr_t arg, int *errcode) {
+    wlan_scan_req_t *req = MP_OBJ_TO_PTR(self_in);
+    if (request == MP_STREAM_POLL) {
+        return (arg & MP_STREAM_POLL_RD) && wlan_scan_req_done(req) ? MP_STREAM_POLL_RD : 0;
+    }
+    if (request == MP_STREAM_POLL_WAKES) {
+        return 1;
+    }
+    *errcode = MP_EINVAL;
+    return MP_STREAM_ERROR;
+}
+
+static const mp_rom_map_elem_t wlan_scan_req_locals_dict_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_result), MP_ROM_PTR(&wlan_scan_req_result_obj) },
+};
+static MP_DEFINE_CONST_DICT(wlan_scan_req_locals_dict, wlan_scan_req_locals_dict_table);
+
+static const mp_stream_p_t wlan_scan_req_stream_p = {
+    .ioctl = wlan_scan_req_ioctl,
+};
+
+static MP_DEFINE_CONST_OBJ_TYPE(
+    wlan_scan_req_type,
+    MP_QSTR_wlan_scan_request,
+    MP_TYPE_FLAG_NONE,
+    protocol, &wlan_scan_req_stream_p,
+    locals_dict, &wlan_scan_req_locals_dict
+    );
+
+// State changes for event loops: WLAN._changes() returns an object that reads
+// readable through select.poll() once any Wi-Fi or IP event has happened since
+// it was made or last clear()ed -- the moment to look at status(),
+// isconnected() or ipconfig() again. Every event wakes the MicroPython task.
+
+typedef struct _wlan_changes_t {
+    mp_obj_base_t base;
+    uint32_t seen;
+} wlan_changes_t;
+
+static const mp_obj_type_t wlan_changes_type;
+
+static mp_obj_t network_wlan_changes(mp_obj_t self_in) {
+    wlan_changes_t *changes = mp_obj_malloc(wlan_changes_t, &wlan_changes_type);
+    changes->seen = wifi_changes;
+    return MP_OBJ_FROM_PTR(changes);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(network_wlan_changes_obj, network_wlan_changes);
+
+static mp_obj_t wlan_changes_clear(mp_obj_t self_in) {
+    wlan_changes_t *changes = MP_OBJ_TO_PTR(self_in);
+    changes->seen = wifi_changes;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(wlan_changes_clear_obj, wlan_changes_clear);
+
+static mp_uint_t wlan_changes_ioctl(mp_obj_t self_in, mp_uint_t request, uintptr_t arg, int *errcode) {
+    wlan_changes_t *changes = MP_OBJ_TO_PTR(self_in);
+    if (request == MP_STREAM_POLL) {
+        return (arg & MP_STREAM_POLL_RD) && changes->seen != wifi_changes ? MP_STREAM_POLL_RD : 0;
+    }
+    if (request == MP_STREAM_POLL_WAKES) {
+        return 1;
+    }
+    *errcode = MP_EINVAL;
+    return MP_STREAM_ERROR;
+}
+
+static const mp_rom_map_elem_t wlan_changes_locals_dict_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_clear), MP_ROM_PTR(&wlan_changes_clear_obj) },
+};
+static MP_DEFINE_CONST_DICT(wlan_changes_locals_dict, wlan_changes_locals_dict_table);
+
+static const mp_stream_p_t wlan_changes_stream_p = {
+    .ioctl = wlan_changes_ioctl,
+};
+
+static MP_DEFINE_CONST_OBJ_TYPE(
+    wlan_changes_type,
+    MP_QSTR_wlan_changes,
+    MP_TYPE_FLAG_NONE,
+    protocol, &wlan_changes_stream_p,
+    locals_dict, &wlan_changes_locals_dict
+    );
 
 static mp_obj_t network_wlan_isconnected(mp_obj_t self_in) {
     wlan_if_obj_t *self = MP_OBJ_TO_PTR(self_in);
@@ -782,6 +1015,8 @@ static const mp_rom_map_elem_t wlan_if_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_disconnect), MP_ROM_PTR(&network_wlan_disconnect_obj) },
     { MP_ROM_QSTR(MP_QSTR_status), MP_ROM_PTR(&network_wlan_status_obj) },
     { MP_ROM_QSTR(MP_QSTR_scan), MP_ROM_PTR(&network_wlan_scan_obj) },
+    { MP_ROM_QSTR(MP_QSTR__scan_start), MP_ROM_PTR(&network_wlan_scan_start_obj) },
+    { MP_ROM_QSTR(MP_QSTR__changes), MP_ROM_PTR(&network_wlan_changes_obj) },
     { MP_ROM_QSTR(MP_QSTR_isconnected), MP_ROM_PTR(&network_wlan_isconnected_obj) },
     { MP_ROM_QSTR(MP_QSTR_config), MP_ROM_PTR(&network_wlan_config_obj) },
     { MP_ROM_QSTR(MP_QSTR_ifconfig), MP_ROM_PTR(&esp_network_ifconfig_obj) },
