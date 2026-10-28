@@ -99,6 +99,31 @@ StreamReader = Stream
 StreamWriter = Stream
 
 
+# One client context for every ssl=True connection. Nothing in a default context
+# differs between connections, so building one each time would only repeat the
+# same setup -- seeding a random generator from the entropy source -- for nothing.
+#
+# Where the ssl module offers create_default_context() -- firmware with a root
+# store -- ssl=True verifies the server, as it does in CPython. Without one it
+# stays what MicroPython's ssl=True has always been: encrypted, not verified.
+_ssl_default = None
+
+
+def _default_ssl_context():
+    global _ssl_default
+    if _ssl_default is None:
+        import ssl
+
+        if hasattr(ssl, "create_default_context"):
+            try:
+                _ssl_default = ssl.create_default_context()
+            except AttributeError:  # an ssl.py with it, a firmware without a store
+                _ssl_default = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        else:
+            _ssl_default = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    return _ssl_default
+
+
 # Create a TCP stream connection to a remote host
 #
 # async
@@ -117,9 +142,7 @@ def open_connection(host, port, ssl=None, server_hostname=None):
     # wrap with SSL, if requested
     if ssl:
         if ssl is True:
-            import ssl as _ssl
-
-            ssl = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+            ssl = _default_ssl_context()
         if not server_hostname:
             server_hostname = host
         s = ssl.wrap_socket(s, server_hostname=server_hostname, do_handshake_on_connect=False)
