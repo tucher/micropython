@@ -266,17 +266,21 @@ static mp_int_t mp_machine_reset_cause(void) {
 #else
 #include "soc/lp_system_reg.h"
 #endif
-#if CONFIG_IDF_TARGET_ESP32S3
-#include "esp32s3/rom/usb/usb_dc.h"
-#include "esp32s3/rom/usb/usb_persist.h"
-#include "esp32s3/rom/usb/chip_usb_dw_wrapper.h"
+#if CONFIG_IDF_TARGET_ESP32S3 && MICROPY_HW_USB_CDC
+#include "tusb.h"
 #endif
 
 MP_NORETURN void machine_bootloader_rtc(void) {
     #if CONFIG_IDF_TARGET_ESP32S3 && MICROPY_HW_USB_CDC
+    // The ROM bootloader answers on USB-Serial-JTAG, so hand the port over to
+    // it first. Drop TinyUSB's connection before that and give the host time
+    // to see the device go: switched over while still connected, the host
+    // keeps talking to the old device, never enumerates the new one, and the
+    // board goes silent until it is power-cycled. The ROM's own USB
+    // persistence is not used: TinyUSB, not the ROM's driver, ran the port.
+    tud_disconnect();
+    mp_hal_delay_ms(100);
     usb_usj_mode();
-    usb_dc_prepare_persist();
-    chip_usb_set_persist_flags(USBDC_BOOT_DFU);
     #endif
     #if !CONFIG_IDF_TARGET_ESP32P4
     REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
