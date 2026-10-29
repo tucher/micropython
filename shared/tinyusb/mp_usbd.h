@@ -103,9 +103,12 @@ static inline void mp_usbd_init(void) {
     // Without runtime USB support, this can be a thin wrapper wrapper around tusb_init()
     // which is called in the below helper function.
     MICROPY_HW_TINYUSB_LL_INIT();
-    mp_usbd_init_tud();
     #if MICROPY_HW_USBDEV_NATIVE_TASK
+    // The task initialises TinyUSB itself, so that the controller's interrupt
+    // is allocated on the task's core and its work is all done there.
     MICROPY_HW_USBDEV_TASK_START();
+    #else
+    mp_usbd_init_tud();
     #endif
 }
 

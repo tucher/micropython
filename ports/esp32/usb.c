@@ -77,23 +77,31 @@ void usb_usj_mode(void) {
 #endif
 
 #ifndef MICROPY_HW_USBDEV_TASK_CORE
-// The VM's core, where TinyUSB's interrupt is too. A board that streams over
-// USB may move it to the other core, so its work does not take the VM's time.
+// The VM's core by default. A board that streams over USB may move it to the
+// other core, so its work does not take the VM's time: the controller's
+// interrupt goes with it, since the task is where TinyUSB is initialised.
 #define MICROPY_HW_USBDEV_TASK_CORE MP_TASK_COREID
 #endif
 
 static void usb_task(void *arg) {
+    // The controller's interrupt is allocated on the core that initialises
+    // TinyUSB: with no DMA, the interrupt copies every packet through the
+    // FIFOs, which at full speed on a bulk endpoint is most of the work.
+    tusb_init();
     for (;;) {
         tud_task_ext(UINT32_MAX, false);    // blocks on TinyUSB's event queue
     }
 }
 
-// TinyUSB's own task, started once TinyUSB is initialised and kept across soft
-// resets.
+// TinyUSB's own task, which initialises it; started once, kept across soft
+// resets, and returns once TinyUSB is up.
 void usb_task_start(void) {
     static TaskHandle_t task;
     if (task == NULL) {
         xTaskCreatePinnedToCore(usb_task, "tinyusb", 4096, NULL, MICROPY_HW_USBDEV_TASK_PRIORITY, &task, MICROPY_HW_USBDEV_TASK_CORE);
+        while (!tusb_inited()) {
+            vTaskDelay(1);
+        }
     }
 }
 
