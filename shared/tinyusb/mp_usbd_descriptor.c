@@ -86,6 +86,8 @@ const uint8_t mp_usbd_builtin_desc_cfg[MP_USBD_BUILTIN_DESC_CFG_LEN] = {
     #endif
 };
 
+#if !MICROPY_HW_USBDEV_BOARD_DESCRIPTORS
+
 const uint16_t *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     char serial_buf[MICROPY_HW_USB_DESC_STR_MAX + 1]; // Includes terminating NUL byte
     static uint16_t desc_wstr[MICROPY_HW_USB_DESC_STR_MAX + 1]; // Includes prefix uint16_t
@@ -189,5 +191,7 @@ uint8_t const *tud_descriptor_device_qualifier_cb(void) {
 // If runtime device support is enabled, descriptor callbacks are implemented in usbd.c
 
 #endif // !MICROPY_HW_ENABLE_USB_RUNTIME_DEVICE
+
+#endif // !MICROPY_HW_USBDEV_BOARD_DESCRIPTORS
 
 #endif // MICROPY_HW_ENABLE_USBDEV

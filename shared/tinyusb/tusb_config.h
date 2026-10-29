@@ -39,6 +39,13 @@
 #define MICROPY_HW_USBDEV_NATIVE_TASK 0
 #endif
 
+// The board supplies TinyUSB's descriptor callbacks (device, configuration,
+// strings) for a device of its own making; the CDC REPL still expects
+// interface USBD_ITF_CDC and endpoints USBD_CDC_EP_CMD/IN/OUT.
+#ifndef MICROPY_HW_USBDEV_BOARD_DESCRIPTORS
+#define MICROPY_HW_USBDEV_BOARD_DESCRIPTORS 0
+#endif
+
 #if MICROPY_HW_USBDEV_NATIVE_TASK
 // TinyUSB runs in a task of its own (the port starts it with
 // MICROPY_HW_USBDEV_TASK_START): its event queue blocks and wakes that task,

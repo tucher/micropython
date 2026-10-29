@@ -76,18 +76,24 @@ void usb_usj_mode(void) {
 #define MICROPY_HW_USBDEV_TASK_PRIORITY (ESP_TASK_PRIO_MIN + 5)
 #endif
 
+#ifndef MICROPY_HW_USBDEV_TASK_CORE
+// The VM's core, where TinyUSB's interrupt is too. A board that streams over
+// USB may move it to the other core, so its work does not take the VM's time.
+#define MICROPY_HW_USBDEV_TASK_CORE MP_TASK_COREID
+#endif
+
 static void usb_task(void *arg) {
     for (;;) {
         tud_task_ext(UINT32_MAX, false);    // blocks on TinyUSB's event queue
     }
 }
 
-// TinyUSB's own task, on the VM's core (its interrupt is there too), started
-// once TinyUSB is initialised and kept across soft resets.
+// TinyUSB's own task, started once TinyUSB is initialised and kept across soft
+// resets.
 void usb_task_start(void) {
     static TaskHandle_t task;
     if (task == NULL) {
-        xTaskCreatePinnedToCore(usb_task, "tinyusb", 4096, NULL, MICROPY_HW_USBDEV_TASK_PRIORITY, &task, MP_TASK_COREID);
+        xTaskCreatePinnedToCore(usb_task, "tinyusb", 4096, NULL, MICROPY_HW_USBDEV_TASK_PRIORITY, &task, MICROPY_HW_USBDEV_TASK_CORE);
     }
 }
 
@@ -95,7 +101,7 @@ void usb_task_start(void) {
 
 void mp_usbd_port_get_serial_number(char *serial_buf) {
     // use factory default MAC as serial ID
-    uint8_t mac[8];
+    uint8_t mac[8] = {0};               // the MAC is 6 bytes: the rest must not be stack garbage
     esp_efuse_mac_get_default(mac);
     MP_STATIC_ASSERT(sizeof(mac) * 2 <= MICROPY_HW_USB_DESC_STR_MAX);
     mp_usbd_hex_str(serial_buf, mac, sizeof(mac));
