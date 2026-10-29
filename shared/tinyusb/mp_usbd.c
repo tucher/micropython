@@ -30,6 +30,18 @@
 
 #include "mp_usbd.h"
 
+#if MICROPY_HW_USBDEV_NATIVE_TASK
+
+// TinyUSB runs in the port's own task (MICROPY_HW_USBDEV_TASK_START), woken by
+// its event queue; the VM never runs it.
+void mp_usbd_task(void) {
+}
+
+void mp_usbd_schedule_task(void) {
+}
+
+#else
+
 #if !MICROPY_HW_ENABLE_USB_RUNTIME_DEVICE
 
 void mp_usbd_task(void) {
@@ -53,6 +65,8 @@ TU_ATTR_FAST_FUNC void mp_usbd_schedule_task(void) {
     static mp_sched_node_t usbd_task_node;
     mp_sched_schedule_node(&usbd_task_node, mp_usbd_task_callback);
 }
+
+#endif // MICROPY_HW_USBDEV_NATIVE_TASK
 
 void mp_usbd_hex_str(char *out_str, const uint8_t *bytes, size_t bytes_len) {
     size_t hex_len = bytes_len * 2;

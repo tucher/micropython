@@ -35,6 +35,18 @@
 #define MICROPY_HW_ENABLE_USB_RUNTIME_DEVICE 0
 #endif
 
+#ifndef MICROPY_HW_USBDEV_NATIVE_TASK
+#define MICROPY_HW_USBDEV_NATIVE_TASK 0
+#endif
+
+#if MICROPY_HW_USBDEV_NATIVE_TASK
+// TinyUSB runs in a task of its own (the port starts it with
+// MICROPY_HW_USBDEV_TASK_START): its event queue blocks and wakes that task,
+// and its FIFOs take a mutex, since the VM writes the REPL's output into one.
+#define CFG_TUSB_OS             OPT_OS_FREERTOS
+#define CFG_TUSB_OS_INC_PATH    freertos/
+#endif
+
 #ifndef MICROPY_HW_USB_MANUFACTURER_STRING
 #define MICROPY_HW_USB_MANUFACTURER_STRING "MicroPython"
 #endif

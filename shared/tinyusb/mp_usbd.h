@@ -104,6 +104,9 @@ static inline void mp_usbd_init(void) {
     // which is called in the below helper function.
     MICROPY_HW_TINYUSB_LL_INIT();
     mp_usbd_init_tud();
+    #if MICROPY_HW_USBDEV_NATIVE_TASK
+    MICROPY_HW_USBDEV_TASK_START();
+    #endif
 }
 
 static inline void mp_usbd_deinit(void) {

@@ -64,6 +64,35 @@ void usb_usj_mode(void) {
 }
 #endif
 
+#if MICROPY_HW_USBDEV_NATIVE_TASK
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_task.h"
+#include "mphalport.h"
+
+#ifndef MICROPY_HW_USBDEV_TASK_PRIORITY
+// Above the VM, which it preempts when USB needs it; below the radios.
+#define MICROPY_HW_USBDEV_TASK_PRIORITY (ESP_TASK_PRIO_MIN + 5)
+#endif
+
+static void usb_task(void *arg) {
+    for (;;) {
+        tud_task_ext(UINT32_MAX, false);    // blocks on TinyUSB's event queue
+    }
+}
+
+// TinyUSB's own task, on the VM's core (its interrupt is there too), started
+// once TinyUSB is initialised and kept across soft resets.
+void usb_task_start(void) {
+    static TaskHandle_t task;
+    if (task == NULL) {
+        xTaskCreatePinnedToCore(usb_task, "tinyusb", 4096, NULL, MICROPY_HW_USBDEV_TASK_PRIORITY, &task, MP_TASK_COREID);
+    }
+}
+
+#endif // MICROPY_HW_USBDEV_NATIVE_TASK
+
 void mp_usbd_port_get_serial_number(char *serial_buf) {
     // use factory default MAC as serial ID
     uint8_t mac[8];

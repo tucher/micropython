@@ -42,8 +42,26 @@
 static uint8_t cdc_itf_pending; // keep track of cdc interfaces which need attention to poll
 static int8_t cdc_connected_flush_delay = 0;
 
+#if MICROPY_HW_USBDEV_NATIVE_TASK
+// Run in TinyUSB's task: the input stdin had no room for (only that task reads
+// the CDC FIFOs and writes stdin, so stdin keeps one writer).
+static void cdc_drain_pending(void *arg) {
+    (void)arg;
+    for (uint8_t itf = 0; itf < 8 && cdc_itf_pending; ++itf) {
+        if (cdc_itf_pending & (1 << itf)) {
+            tud_cdc_rx_cb(itf);
+        }
+    }
+}
+#endif
+
 uintptr_t mp_usbd_cdc_poll_interfaces(uintptr_t poll_flags) {
     uintptr_t ret = 0;
+    #if MICROPY_HW_USBDEV_NATIVE_TASK
+    if (cdc_itf_pending && ringbuf_free(&stdin_ringbuf)) {
+        usbd_defer_func(cdc_drain_pending, NULL, false);
+    }
+    #else
     if (!cdc_itf_pending) {
         // Explicitly run the USB stack as the scheduler may be locked (eg we are in
         // an interrupt handler) while there is data pending.
@@ -61,6 +79,7 @@ uintptr_t mp_usbd_cdc_poll_interfaces(uintptr_t poll_flags) {
             }
         }
     }
+    #endif
     if ((poll_flags & MP_STREAM_POLL_RD) && ringbuf_peek(&stdin_ringbuf) != -1) {
         ret |= MP_STREAM_POLL_RD;
     }
@@ -94,9 +113,13 @@ void MICROPY_WRAP_TUD_CDC_RX_CB(tud_cdc_rx_cb)(uint8_t itf) {
             #endif
         } else {
             cdc_itf_pending |= (1 << itf);
-            return;
+            break;
         }
     }
+    #if MICROPY_HW_USBDEV_NATIVE_TASK
+    // Input arrives in TinyUSB's task: wake the VM, which may be waiting for it.
+    mp_hal_wake_main_task();
+    #endif
 }
 
 mp_uint_t mp_usbd_cdc_tx_strn(const char *str, mp_uint_t len) {
@@ -199,6 +222,9 @@ void MICROPY_WRAP_TUD_CDC_LINE_STATE_CB(tud_cdc_line_state_cb)(uint8_t itf, bool
     if (dtr && !rts) {
         if (prev_line_state.rts && !prev_line_state.dtr) {
             mp_sched_schedule_node(&mp_bootloader_sched_node, usbd_cdc_run_bootloader_task);
+            #if MICROPY_HW_USBDEV_NATIVE_TASK
+            mp_hal_wake_main_task();
+            #endif
         }
     }
     prev_line_state.rts = rts;

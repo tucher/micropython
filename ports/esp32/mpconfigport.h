@@ -294,8 +294,24 @@ void esp32_gc_heap_free(void *ptr);
 #define MICROPY_HW_USB_VID  (USB_ESPRESSIF_VID)
 #endif
 
+// TinyUSB in a FreeRTOS task of its own (usb.c) instead of on the VM through
+// the scheduler, so that USB is serviced while the VM renders, collects garbage
+// or writes flash (isochronous endpoints, for one, must be re-armed every
+// frame). USB class drivers written in Python (machine.USBDevice) cannot run
+// there, since their callbacks would run outside the VM.
+#ifndef MICROPY_HW_USBDEV_NATIVE_TASK
+#define MICROPY_HW_USBDEV_NATIVE_TASK       (0)
+#endif
+
 #ifndef MICROPY_HW_ENABLE_USB_RUNTIME_DEVICE
-#define MICROPY_HW_ENABLE_USB_RUNTIME_DEVICE    (1) // Support machine.USBDevice
+#define MICROPY_HW_ENABLE_USB_RUNTIME_DEVICE    (!MICROPY_HW_USBDEV_NATIVE_TASK) // Support machine.USBDevice
+#endif
+
+#if MICROPY_HW_USBDEV_NATIVE_TASK
+#if MICROPY_HW_ENABLE_USB_RUNTIME_DEVICE
+#error "machine.USBDevice needs TinyUSB to run on the VM"
+#endif
+#define MICROPY_HW_USBDEV_TASK_START() ({ extern void usb_task_start(void); usb_task_start(); })
 #endif
 
 #ifndef MICROPY_HW_USB_PID
