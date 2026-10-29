@@ -53,6 +53,19 @@ static void cdc_drain_pending(void *arg) {
         }
     }
 }
+
+// Starting a transfer changes the controller's endpoint registers, which
+// TinyUSB's interrupt and task change too: only the task may do it. The VM
+// leaves its output in the CDC FIFO (which has a mutex) and has the task send
+// it; one such request queued at a time is enough, and TinyUSB sends what is
+// left in the FIFO as each transfer completes.
+static volatile bool cdc_flush_queued;
+
+static void cdc_flush(void *arg) {
+    (void)arg;
+    cdc_flush_queued = false;
+    tud_cdc_write_flush();
+}
 #endif
 
 uintptr_t mp_usbd_cdc_poll_interfaces(uintptr_t poll_flags) {
@@ -141,7 +154,14 @@ mp_uint_t mp_usbd_cdc_tx_strn(const char *str, mp_uint_t len) {
         }
 
         uint32_t n2 = tud_cdc_write(str + i, n);
+        #if MICROPY_HW_USBDEV_NATIVE_TASK
+        if (!cdc_flush_queued) {
+            cdc_flush_queued = true;
+            usbd_defer_func(cdc_flush, NULL, false);
+        }
+        #else
         tud_cdc_write_flush();
+        #endif
         i += n2;
 
         if (i < len) {
