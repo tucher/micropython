@@ -36,6 +36,12 @@ DWORD get_fattime(void) {
     timeutils_struct_time_t tm;
     timeutils_seconds_since_epoch_to_struct_time(tv.tv_sec, &tm);
 
+    // FAT counts years from 1980. A clock not yet set (still near 1970) would
+    // otherwise wrap round to 2098; date such files at FAT's first day instead.
+    if (tm.tm_year < 1980) {
+        return ((DWORD)1 << 21) | ((DWORD)1 << 16);
+    }
+
     return ((DWORD)(tm.tm_year - 1980) << 25) | ((DWORD)tm.tm_mon << 21) | ((DWORD)tm.tm_mday << 16) |
            ((DWORD)tm.tm_hour << 11) | ((DWORD)tm.tm_min << 5) | ((DWORD)tm.tm_sec >> 1);
 }
